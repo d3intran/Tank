@@ -1,4 +1,5 @@
 #include "TankPawn.h"
+#include "Tank.h"
 #include "Components/BoxComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/SceneComponent.h"
@@ -73,10 +74,20 @@ void ATankPawn::BeginPlay()
 {
 	Super::BeginPlay();
 
-	if (TracksMesh && TracksMesh->GetNumMaterials() > 0)
+	if (ensureMsgf(TracksMesh, TEXT("TracksMesh is null on ATankPawn!")))
 	{
-		TrackMaterialInstance = TracksMesh->CreateAndSetMaterialInstanceDynamic(0);
+		if (TracksMesh->GetNumMaterials() > 0)
+		{
+			TrackMaterialInstance = TracksMesh->CreateAndSetMaterialInstanceDynamic(0);
+		}
+		else
+		{
+			UE_LOG(LogTank, Warning, TEXT("TracksMesh has no materials assigned. Track UV animation will not function."));
+		}
 	}
+
+	UE_LOG(LogTank, Log, TEXT("TankPawn initialized with MoveSpeed=%.1f, TurnSpeed=%.1f, TurretRotateSpeed=%.1f"), 
+		MoveSpeed, TurnSpeed, TurretRotateSpeed);
 }
 
 void ATankPawn::Tick(float DeltaTime)
@@ -86,13 +97,13 @@ void ATankPawn::Tick(float DeltaTime)
 	// 1. WASD 前后移动
 	if (!FMath::IsNearlyZero(CurrentMoveInput))
 	{
-		FVector MoveDelta = FVector(CurrentMoveInput * MoveSpeed * DeltaTime, 0.0f, 0.0f);
+		const FVector MoveDelta = FVector(CurrentMoveInput * MoveSpeed * DeltaTime, 0.0f, 0.0f);
 		FHitResult Hit;
 		AddActorLocalOffset(MoveDelta, true, &Hit);
 
 		if (TrackMaterialInstance)
 		{
-			TrackUVOffset += CurrentMoveInput * (MoveSpeed / 300.0f) * DeltaTime;
+			TrackUVOffset += CurrentMoveInput * (MoveSpeed / FMath::Max(1.0f, TrackUVSpeedScale)) * DeltaTime;
 			TrackMaterialInstance->SetScalarParameterValue(TrackOffsetParamName, TrackUVOffset);
 		}
 	}
@@ -100,12 +111,12 @@ void ATankPawn::Tick(float DeltaTime)
 	// 2. WASD 原地差速掉头
 	if (!FMath::IsNearlyZero(CurrentTurnInput))
 	{
-		FRotator TurnDelta = FRotator(0.0f, CurrentTurnInput * TurnSpeed * DeltaTime, 0.0f);
+		const FRotator TurnDelta = FRotator(0.0f, CurrentTurnInput * TurnSpeed * DeltaTime, 0.0f);
 		AddActorLocalRotation(TurnDelta, true);
 
 		if (TrackMaterialInstance && FMath::IsNearlyZero(CurrentMoveInput))
 		{
-			TrackUVOffset += CurrentTurnInput * (TurnSpeed / 30.0f) * DeltaTime;
+			TrackUVOffset += CurrentTurnInput * (TurnSpeed / FMath::Max(1.0f, TrackUVSpeedScale * 0.1f)) * DeltaTime;
 			TrackMaterialInstance->SetScalarParameterValue(TrackOffsetParamName, TrackUVOffset);
 		}
 	}
