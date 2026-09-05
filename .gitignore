@@ -36,3 +36,4 @@ Thumbs.db
 .agents/
 .vscode/
 .idea/
+__pycache__/
