@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Pawn.h"
+#include "InputActionValue.h"
 #include "TankPawn.generated.h"
 
 class UBoxComponent;
@@ -11,6 +12,8 @@ class USpringArmComponent;
 class UCameraComponent;
 class UMaterialInstanceDynamic;
 class ATankProjectile;
+class UInputAction;
+class UInputMappingContext;
 
 UCLASS()
 class TANK_API ATankPawn : public APawn
@@ -40,6 +43,9 @@ protected:
 	TObjectPtr<UStaticMeshComponent> TracksMesh;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Tank|Components")
+	TArray<TObjectPtr<UStaticMeshComponent>> RoadWheels;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Tank|Components")
 	TObjectPtr<USceneComponent> TurretPivot;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Tank|Components")
@@ -60,8 +66,8 @@ protected:
 	// ==========================================
 	// Camera Parameters (现代主流视口稳定跟随)
 	// ==========================================
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tank|Camera", meta = (ClampMin = "0.01", UIMin = "0.1", UIMax = "5.0"))
-	float CameraSensitivityX = 1.0f; // 鼠标横向旋转视口灵敏度
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tank|Camera", meta = (ClampMin = "0.001", UIMin = "0.01", UIMax = "0.5"))
+	float CameraSensitivityX = 0.07f; // 鼠标横向旋转视口灵敏度（Enhanced 原始鼠标量纲）
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tank|Camera", meta = (ClampMin = "-45.0", ClampMax = "0.0", Units = "deg"))
 	float FixedCameraPitch = -12.0f; // 锁定舒适第三人称俯角，彻底杜绝上下晃动眩晕
@@ -85,6 +91,15 @@ protected:
 	float TurnSpeed = 60.0f;
 
 	// ==========================================
+	// Wheel Parameters (负重轮差速旋转，布局由 Scripts/split_tank_mesh.py 生成)
+	// ==========================================
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tank|Wheels", meta = (ClampMin = "1.0", Units = "cm"))
+	float TrackSpan = 278.4f; // 左右侧履带间距，转向差速计算用
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tank|Wheels")
+	bool bInvertWheelSpin = false; // 视觉上轮子转向与行驶方向相反时勾选
+
+	// ==========================================
 	// Turret & Gun Parameters (电驱伺服机械平滑追踪与双向稳定)
 	// ==========================================
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tank|Turret", meta = (ClampMin = "1.0", UIMin = "5.0", UIMax = "120.0", Units = "deg/s"))
@@ -93,8 +108,8 @@ protected:
 	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Category = "Tank|Turret")
 	float CurrentTurretYaw = 0.0f;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tank|Gun", meta = (ClampMin = "0.01", UIMin = "0.1", UIMax = "5.0"))
-	float PitchSensitivity = 0.8f; // 鼠标纵向调炮灵敏度
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tank|Gun", meta = (ClampMin = "0.001", UIMin = "0.01", UIMax = "0.5"))
+	float PitchSensitivity = 0.056f; // 鼠标纵向调炮灵敏度（Enhanced 原始鼠标量纲）
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tank|Gun")
 	bool bInvertPitch = false; // 反转俯仰方向选项
@@ -138,6 +153,39 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tank|Combat")
 	float RecoilRecoverySpeed = 8.0f; // 液压驻退机复位速度
 
+	// ==========================================
+	// Enhanced Input（动作资产在 /Game/tank/inputs/，由 MCP 创建并保存）
+	// ==========================================
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Input")
+	TObjectPtr<UInputMappingContext> DefaultMappingContext;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Input")
+	TObjectPtr<UInputAction> MoveForwardAction;   // W：前进
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Input")
+	TObjectPtr<UInputAction> MoveBackwardAction;  // S：倒退
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Input")
+	TObjectPtr<UInputAction> TurnRightAction;     // D：右转
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Input")
+	TObjectPtr<UInputAction> TurnLeftAction;      // A：左转
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Input")
+	TObjectPtr<UInputAction> TurretCWAction;      // E：炮塔顺时针微调
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Input")
+	TObjectPtr<UInputAction> TurretCCWAction;     // Q：炮塔逆时针微调
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Input")
+	TObjectPtr<UInputAction> CameraYawAction;     // 鼠标 X：视口偏航
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Input")
+	TObjectPtr<UInputAction> GunPitchAction;      // 鼠标 Y：火炮俯仰
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Input")
+	TObjectPtr<UInputAction> FireAction;          // 左键：主炮开火
+
 	float CurrentRecoilOffset = 0.0f;
 	float LastFireTime = -100.0f;
 
@@ -167,19 +215,22 @@ public:
 	}
 
 private:
-	// Input Handlers
-	void MoveForwardInput(float Value);
-	void TurnInput(float Value);
-	void TurnCameraInput(float Value);
-	void LookUpCameraInput(float Value);
-	void FireInput();
-
-	// Manual Keyboard Overrides (保留兼容)
-	void TurretRotateInput(float Value);
-	void PitchUpInput(float Value);
+	// Input Handlers（Enhanced Input 回调，方向由独立动作资产表达）
+	void MoveForward();
+	void MoveBackward();
+	void TurnRight();
+	void TurnLeft();
+	void TurretCW();
+	void TurretCCW();
+	void OrbitCamera(const FInputActionValue& Value);
+	void ElevateGun(const FInputActionValue& Value);
+	void Fire();
 
 	float CurrentMoveInput = 0.0f;
 	float CurrentTurnInput = 0.0f;
 	float CurrentTurretRotateInput = 0.0f;
 	float CurrentPitchInput = 0.0f;
+
+	// 负重轮累计转角（度），与 RoadWheels 一一对应
+	TArray<float> RoadWheelAngles;
 };

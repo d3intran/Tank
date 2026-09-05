@@ -1,6 +1,7 @@
 import os
 import struct
 import zlib
+import math
 
 SCALE = 0.5  # Model is authored in half-centimeters; 0.5 brings it to 1:1 true Unreal Engine cm
 
@@ -76,13 +77,13 @@ def parse_geometry(data, geom_name):
 
     return verts, indices, normals, normals_index, uvs, uv_index
 
-def export_polygons_to_obj(filepath, object_name, material_name, verts, normals, normals_index, uvs, uv_index, target_polys, pivot=(0.0, 0.0, 0.0)):
+def export_polygons_to_obj(filepath, object_name, material_name, verts, normals, normals_index, uvs, uv_index, target_polys, pivot=(0.0, 0.0, 0.0), smooth_normals=False):
     px, py, pz = pivot
     with open(filepath, 'w', encoding='utf-8') as out:
         out.write(f"# Exported by split_tank_mesh.py\n")
         out.write(f"o {object_name}\n")
         out.write(f"usemtl {material_name}\n")
-        
+
         # 1-based vertex map
         v_map = {}
         for poly_verts, _ in target_polys:
@@ -94,16 +95,39 @@ def export_polygons_to_obj(filepath, object_name, material_name, verts, normals,
                     z = (verts[v*3+2] - pz) * SCALE
                     out.write(f"v {x:.4f} {y:.4f} {z:.4f}\n")
 
-        vn_map = {}
+        # per-corner normals from the FBX source
+        corner_normals = {}
         for _, corners in target_polys:
             for c in corners:
                 n_idx = normals_index[c] if normals_index else c
-                if n_idx not in vn_map:
-                    vn_map[n_idx] = len(vn_map) + 1
-                    nx = normals[n_idx*3]
-                    ny = normals[n_idx*3+1]
-                    nz = normals[n_idx*3+2]
-                    out.write(f"vn {nx:.4f} {ny:.4f} {nz:.4f}\n")
+                corner_normals[c] = (normals[n_idx*3], normals[n_idx*3+1], normals[n_idx*3+2])
+
+        if smooth_normals:
+            # weld normals by vertex position: rotating low-poly wheels with
+            # flat per-face normals shimmer under directional light
+            vn_acc = {}
+            for poly_verts, corners in target_polys:
+                for v, c in zip(poly_verts, corners):
+                    nx, ny, nz = corner_normals[c]
+                    acc = vn_acc.setdefault(v, [0.0, 0.0, 0.0, 0])
+                    acc[0] += nx; acc[1] += ny; acc[2] += nz; acc[3] += 1
+            vn_map = {}
+            for v in v_map:
+                nx, ny, nz, cnt = vn_acc[v]
+                ln = math.sqrt(nx*nx + ny*ny + nz*nz) or 1.0
+                vn_map[v] = len(vn_map) + 1
+                out.write(f"vn {nx/ln:.4f} {ny/ln:.4f} {nz/ln:.4f}\n")
+        else:
+            vn_map = {}
+            for _, corners in target_polys:
+                for c in corners:
+                    n_idx = normals_index[c] if normals_index else c
+                    if n_idx not in vn_map:
+                        vn_map[n_idx] = len(vn_map) + 1
+                        nx = normals[n_idx*3]
+                        ny = normals[n_idx*3+1]
+                        nz = normals[n_idx*3+2]
+                        out.write(f"vn {nx:.4f} {ny:.4f} {nz:.4f}\n")
 
         vt_map = {}
         for _, corners in target_polys:
@@ -119,7 +143,8 @@ def export_polygons_to_obj(filepath, object_name, material_name, verts, normals,
             face_tokens = []
             for v, c in zip(poly_verts, corners):
                 v_id = v_map[v]
-                n_id = vn_map[normals_index[c] if normals_index else c]
+                n_key = v if smooth_normals else (normals_index[c] if normals_index else c)
+                n_id = vn_map[n_key]
                 t_id = vt_map[uv_index[c] if uv_index else c]
                 face_tokens.append(f"{v_id}/{t_id}/{n_id}")
             out.write(f"f {' '.join(face_tokens)}\n")
@@ -204,20 +229,78 @@ def split_tank(fbx_path, output_dir):
     # Gun pitch pivot in raw coords: X=335.0, Y=0.0, Z=353.0
     gun_pivot = (335.0, 0.0, 353.0)
 
-    # 1. Export ztz88a_hull.obj
-    hull_polys = [p for p in polygons_317 if find(p[0][0]) in hull_roots]
-    export_polygons_to_obj(os.path.join(output_dir, "ztz88a_hull.obj"), "ztz88a_hull", "mat_61",
+    # Road wheels: 6 per side. Their geometry is fragmented into small patches
+    # scattered across the hull mesh; measured wheel centers (ring scan + probe
+    # thumbnails verified) with nearest-center assignment at radius 85.
+    ROAD_WHEEL_X = (-412.0, -262.0, -112.0, 38.0, 215.0, 399.9)
+    ROAD_WHEEL_Z = 83.5
+    ROAD_WHEEL_CAPTURE = 85.0  # nearest-center wins; > rim radius so wheels stay whole
+
+    def road_wheel_index(poly_verts):
+        xs = [v317[vi * 3] for vi in poly_verts]
+        ys = [v317[vi * 3 + 1] for vi in poly_verts]
+        zs = [v317[vi * 3 + 2] for vi in poly_verts]
+        if max(xs) - min(xs) >= 140 or max(zs) - min(zs) >= 140:
+            return -1
+        cy = (min(ys) + max(ys)) / 2.0
+        if not (200 < abs(cy) < 345):
+            return -1
+        if min(zs) < 0 or max(zs) > 160:
+            return -1
+        cx, cz = (min(xs) + max(xs)) / 2.0, (min(zs) + max(zs)) / 2.0
+        best, best_d = -1, ROAD_WHEEL_CAPTURE
+        for wi, wx in enumerate(ROAD_WHEEL_X):
+            d = ((cx - wx) ** 2 + (cz - ROAD_WHEEL_Z) ** 2) ** 0.5
+            if d <= best_d:
+                best, best_d = wi, d
+        return best
+
+    turret_polys = [p for p in polygons_317 if find(p[0][0]) in turret_roots]
+    gun_polys = [p for p in polygons_317 if find(p[0][0]) in gun_roots]
+
+    road_wheels = {}
+    hull_polys = []
+    for p in polygons_317:
+        if find(p[0][0]) not in hull_roots:
+            continue
+        wi = road_wheel_index(p[0])
+        if wi >= 0:
+            side = 1 if v317[p[0][0] * 3 + 1] >= 0 else -1
+            road_wheels.setdefault((side, wi), []).append(p)
+        else:
+            hull_polys.append(p)
+
+    # 1. Export ztz88a_hull_body.obj (hull with road wheels removed)
+    export_polygons_to_obj(os.path.join(output_dir, "ztz88a_hull_body.obj"), "ztz88a_hull_body", "mat_61",
                            v317, n317, ni317, u317, ui317, hull_polys, pivot=(0.0, 0.0, 0.0))
 
+    # 1b. Export 14 road wheels (pivot = wheel center)
+    for (side, wi), polys in sorted(road_wheels.items()):
+        ys = [v317[vi * 3 + 1] for pv, _ in polys for vi in pv]
+        pivot = (ROAD_WHEEL_X[wi], (min(ys) + max(ys)) / 2.0, ROAD_WHEEL_Z)
+        sname = 'r' if side > 0 else 'l'
+        path = os.path.join(output_dir, f"ztz88a_road_{sname}{wi}.obj")
+        export_polygons_to_obj(path, f"ztz88a_road_{sname}{wi}", "mat_61",
+                               v317, n317, ni317, u317, ui317, polys, pivot=pivot, smooth_normals=True)
+
     # 2. Export ztz88a-turret.obj
-    turret_polys = [p for p in polygons_317 if find(p[0][0]) in turret_roots]
     export_polygons_to_obj(os.path.join(output_dir, "ztz88a-turret.obj"), "ztz88a_turret", "mat_61",
                            v317, n317, ni317, u317, ui317, turret_polys, pivot=turret_pivot)
 
     # 3. Export ztz88a-gun.obj
-    gun_polys = [p for p in polygons_317 if find(p[0][0]) in gun_roots]
     export_polygons_to_obj(os.path.join(output_dir, "ztz88a-gun.obj"), "ztz88a_gun", "mat_61",
                            v317, n317, ni317, u317, ui317, gun_polys, pivot=gun_pivot)
+
+    s = SCALE
+    print("UE road wheel layout (relative to HullMesh, cm):")
+    for (side, wi), polys in sorted(road_wheels.items()):
+        ys = [v317[vi * 3 + 1] for pv, _ in polys for vi in pv]
+        zlo = min(v317[vi * 3 + 2] for pv, _ in polys for vi in pv)
+        zhi = max(v317[vi * 3 + 2] for pv, _ in polys for vi in pv)
+        cy = (min(ys) + max(ys)) / 2.0
+        sname = 'r' if side > 0 else 'l'
+        print(f"  road_{sname}{wi}: loc=({ROAD_WHEEL_X[wi] * s:.2f}, {cy * s:.2f}, {ROAD_WHEEL_Z * s:.2f}) "
+              f"z_span={(zhi - zlo) * s:.1f} mesh=ztz88a_road_{sname}{wi}")
 
     # 4. Parse & Export mesh_318 (Tracks)
     v318, i318, n318, ni318, u318, ui318 = parse_geometry(data, 'mesh_318')
@@ -238,7 +321,11 @@ def split_tank(fbx_path, output_dir):
             cur_v.append(idx)
             cur_corners.append(corner_idx)
 
-    # Export ztz88a_tracks.obj (with material mat_60, exact same origin 0,0,0)
+    # mesh_318 is PURE TRACK: chain, wrap arcs around the sprocket/idler,
+    # guide horns and tips — one static piece. The sprocket/idler discs
+    # themselves live in mesh_317 hidden inside the wrap; every earlier attempt
+    # to spin "end wheels" carved wrap arcs out of this mesh and produced
+    # visible track fragments, so the whole mesh stays unmodified and static.
     export_polygons_to_obj(os.path.join(output_dir, "ztz88a_tracks.obj"), "ztz88a_tracks", "mat_60",
                            v318, n318, ni318, u318, ui318, polygons_318, pivot=(0.0, 0.0, 0.0))
 

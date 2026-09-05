@@ -1,116 +1,153 @@
 import unreal
 import os
 
-def setup_tank_assets():
-    print("=== [Tank Setup] Starting automated asset setup ===")
+# 从零引导整个坦克资产管线（最终版）：
+# 1. 导入车体（无负重轮版）/ 炮塔 / 炮管 / 完整履带 / 12 负重轮
+# 2. 构建 M_TrackScroll（TrackOffset UV 滚动链）并把 mat_60(MIC) 的 parent 指向它
+# 3. 构建 M_TrackStatic（轮盘静态材质，取履带贴图）
+# 4. 材质指派：履带=mat_60，负重轮/车体/炮塔/炮=mat_61
+# 运行：UE 编辑器 > Tools > Execute Python Script。
+# OBJ 由 Scripts/split_tank_mesh.py 从 FBX 源生成。
+
+DEST = "/Game/tank/ztz-88a"
+TRACKS_TEX = f"{DEST}/ztz88a-tracks"
+
+MESHES = [
+    ("ztz88a_hull_body.obj", "ztz88a_hull_body"),
+    ("ztz88a-turret.obj", "ztz88a-turret"),
+    ("ztz88a-gun.obj", "ztz88a-gun"),
+    ("ztz88a_tracks.obj", "ztz88a_tracks_full"),
+    ("ztz88a_road_r0.obj", "ztz88a_road_r0"),
+    ("ztz88a_road_r1.obj", "ztz88a_road_r1"),
+    ("ztz88a_road_r2.obj", "ztz88a_road_r2"),
+    ("ztz88a_road_r3.obj", "ztz88a_road_r3"),
+    ("ztz88a_road_r4.obj", "ztz88a_road_r4"),
+    ("ztz88a_road_r5.obj", "ztz88a_road_r5"),
+    ("ztz88a_road_l0.obj", "ztz88a_road_l0"),
+    ("ztz88a_road_l1.obj", "ztz88a_road_l1"),
+    ("ztz88a_road_l2.obj", "ztz88a_road_l2"),
+    ("ztz88a_road_l3.obj", "ztz88a_road_l3"),
+    ("ztz88a_road_l4.obj", "ztz88a_road_l4"),
+    ("ztz88a_road_l5.obj", "ztz88a_road_l5"),
+]
+
+
+def log(msg):
+    unreal.log(f"[TankSetup] {msg}")
+
+
+def import_meshes():
     asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
-    editor_asset_lib = unreal.EditorAssetLibrary
-
-    content_dir = unreal.Paths.project_content_dir()
-    ztz_dir = os.path.join(content_dir, "tank", "ztz-88a")
-    dest_path = "/Game/tank/ztz-88a"
-
-    # 1. Models to import
-    models = [
-        ("ztz88a_hull.obj", "ztz88a_hull"),
-        ("ztz88a_tracks.obj", "ztz88a_tracks"),
-        ("ztz88a-turret.obj", "ztz88a-turret"),
-        ("ztz88a-gun.obj", "ztz88a-gun"),
-    ]
-
-    imported_meshes = {}
-    for filename, asset_name in models:
+    ztz_dir = os.path.join(unreal.Paths.project_content_dir(), "tank", "ztz-88a")
+    tasks = []
+    for filename, asset_name in MESHES:
         filepath = os.path.join(ztz_dir, filename)
         if not os.path.exists(filepath):
-            print(f"Warning: {filepath} does not exist!")
+            log(f"Warning: {filepath} missing, skipped")
             continue
-
         task = unreal.AssetImportTask()
         task.filename = filepath
-        task.destination_path = dest_path
+        task.destination_path = DEST
         task.destination_name = asset_name
         task.replace_existing = True
         task.automated = True
         task.save = True
+        tasks.append(task)
+    if tasks:
+        asset_tools.import_asset_tasks(tasks)
+        for t in tasks:
+            log(f"Imported {t.destination_name}")
 
-        task.options = None
 
-        asset_tools.import_asset_tasks([task])
-        mesh = editor_asset_lib.load_asset(f"{dest_path}/{asset_name}")
+def has_track_offset_param(mat):
+    for exp in mat.get_editor_property("expressions"):
+        if isinstance(exp, unreal.MaterialExpressionScalarParameter):
+            if str(exp.get_editor_property("parameter_name")) == "TrackOffset":
+                return True
+    return False
+
+
+def build_scroll_material():
+    mat = unreal.EditorAssetLibrary.load_asset(f"{DEST}/M_TrackScroll")
+    if mat and isinstance(mat, unreal.Material):
+        if has_track_offset_param(mat):
+            log("M_TrackScroll already wired")
+            return mat
+    else:
+        mat = unreal.AssetToolsHelpers.get_asset_tools().create_material(DEST, "M_TrackScroll")
+
+    lib = unreal.MaterialEditingLibrary
+    tex_coord = lib.create_material_expression(mat, unreal.MaterialExpressionTextureCoordinate, -600, -100)
+    param = lib.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -600, 100)
+    param.set_editor_property("parameter_name", "TrackOffset")
+    param.set_editor_property("default_value", 0.0)
+    const_zero = lib.create_material_expression(mat, unreal.MaterialExpressionConstant, -600, 250)
+    const_zero.set_editor_property("r", 0.0)
+    append_node = lib.create_material_expression(mat, unreal.MaterialExpressionAppendVector, -420, 150)
+    lib.connect_material_expressions(const_zero, "", append_node, "A")
+    lib.connect_material_expressions(param, "", append_node, "B")
+    add_node = lib.create_material_expression(mat, unreal.MaterialExpressionAdd, -250, 0)
+    lib.connect_material_expressions(tex_coord, "", add_node, "A")
+    lib.connect_material_expressions(append_node, "", add_node, "B")
+    sample = lib.create_material_expression(mat, unreal.MaterialExpressionTextureSample, -60, 0)
+    tex = unreal.EditorAssetLibrary.load_asset(TRACKS_TEX)
+    if tex:
+        sample.set_editor_property("texture", tex)
+    lib.connect_material_expressions(add_node, "", sample, "Coordinates")
+    lib.connect_material_property(sample, "RGB", unreal.MaterialProperty.MP_BASE_COLOR)
+    lib.recompile_material(mat)
+    unreal.EditorAssetLibrary.save_asset(f"{DEST}/M_TrackScroll")
+    log("M_TrackScroll wired")
+    return mat
+
+
+def build_static_material():
+    mat = unreal.EditorAssetLibrary.load_asset(f"{DEST}/M_TrackStatic")
+    if mat and isinstance(mat, unreal.Material) and mat.get_editor_property("expressions"):
+        log("M_TrackStatic already wired")
+        return mat
+    mat = unreal.AssetToolsHelpers.get_asset_tools().create_material(DEST, "M_TrackStatic")
+    lib = unreal.MaterialEditingLibrary
+    sample = lib.create_material_expression(mat, unreal.MaterialExpressionTextureSample, -200, 0)
+    tex = unreal.EditorAssetLibrary.load_asset(TRACKS_TEX)
+    if tex:
+        sample.set_editor_property("texture", tex)
+    lib.connect_material_property(sample, "RGB", unreal.MaterialProperty.MP_BASE_COLOR)
+    lib.recompile_material(mat)
+    unreal.EditorAssetLibrary.save_asset(f"{DEST}/M_TrackStatic")
+    log("M_TrackStatic wired")
+    return mat
+
+
+def main():
+    import_meshes()
+    scroll = build_scroll_material()
+    static_mat = build_static_material()
+    if not scroll or not static_mat:
+        return
+
+    # mat_60 是 OBJ 导入产生的 MaterialInstanceConstant：把 parent 指向滚动材质，
+    # C++ 的 SetScalarParameterValue(TrackOffset) 才能真正生效
+    mat_60 = unreal.EditorAssetLibrary.load_asset(f"{DEST}/mat_60")
+    if mat_60 and not isinstance(mat_60, unreal.Material):
+        mat_60.set_editor_property("parent", scroll)
+        log("mat_60 reparented to M_TrackScroll")
+
+    def assign(asset_name, material):
+        mesh = unreal.EditorAssetLibrary.load_asset(f"{DEST}/{asset_name}")
         if mesh:
-            imported_meshes[asset_name] = mesh
-            print(f"Imported: {dest_path}/{asset_name}")
-        else:
-            print(f"Failed to load: {dest_path}/{asset_name}")
+            mesh.set_material(0, material)
 
-    # 2. Material setup
-    # Hull material (mat_61)
-    mat_hull = editor_asset_lib.load_asset(f"{dest_path}/mat_61")
-    # Track material (mat_60)
-    mat_track = editor_asset_lib.load_asset(f"{dest_path}/mat_60")
+    assign("ztz88a_tracks_full", mat_60)
+    for s in "rl":
+        for i in range(6):
+            assign(f"ztz88a_road_{s}{i}", static_mat)
+    for name in ("ztz88a_hull_body", "ztz88a-turret", "ztz88a-gun"):
+        assign(name, unreal.EditorAssetLibrary.load_asset(f"{DEST}/mat_61"))
 
-    # Ensure mat_track has TrackOffset parameter
-    # If mat_track exists, let's configure its material expression graph
-    if mat_track and isinstance(mat_track, unreal.Material):
-        print("Configuring mat_track with TrackOffset UV offset parameter...")
-        tex_track = editor_asset_lib.load_asset(f"{dest_path}/ztz88a-tracks")
-        
-        # Clear existing expressions if needed, or build UV offset network
-        # Let's inspect material expressions
-        has_track_offset = False
-        for exp in mat_track.get_editor_property("expressions"):
-            if isinstance(exp, unreal.MaterialExpressionScalarParameter):
-                if str(exp.get_editor_property("parameter_name")) == "TrackOffset":
-                    has_track_offset = True
-                    break
+    unreal.EditorAssetLibrary.save_directory(DEST, only_if_is_dirty=True)
+    log("Done. C++ binds ztz88a_hull_body / ztz88a_tracks_full / ztz88a_road_* + /Game/tank/inputs input assets.")
 
-        if not has_track_offset:
-            # Create nodes: TextureCoordinate, ScalarParameter, AppendVector, Add, TextureSample
-            tex_coord = unreal.MaterialEditingLibrary.create_material_expression(mat_track, unreal.MaterialExpressionTextureCoordinate, -400, -100)
-            param_offset = unreal.MaterialEditingLibrary.create_material_expression(mat_track, unreal.MaterialExpressionScalarParameter, -400, 100)
-            param_offset.set_editor_property("parameter_name", "TrackOffset")
-            param_offset.set_editor_property("default_value", 0.0)
-
-            const_zero = unreal.MaterialEditingLibrary.create_material_expression(mat_track, unreal.MaterialExpressionConstant, -400, 250)
-            const_zero.set_editor_property("r", 0.0)
-
-            # Append Vector: (0.0, TrackOffset) -> scrolls along V
-            append_node = unreal.MaterialEditingLibrary.create_material_expression(mat_track, unreal.MaterialExpressionAppendVector, -250, 150)
-            unreal.MaterialEditingLibrary.connect_material_expressions(const_zero, "", append_node, "A")
-            unreal.MaterialEditingLibrary.connect_material_expressions(param_offset, "", append_node, "B")
-
-            # Add node: TexCoord + (0, TrackOffset)
-            add_node = unreal.MaterialEditingLibrary.create_material_expression(mat_track, unreal.MaterialExpressionAdd, -100, 0)
-            unreal.MaterialEditingLibrary.connect_material_expressions(tex_coord, "", add_node, "A")
-            unreal.MaterialEditingLibrary.connect_material_expressions(append_node, "", add_node, "B")
-
-            # Texture sample node
-            tex_sample = unreal.MaterialEditingLibrary.create_material_expression(mat_track, unreal.MaterialExpressionTextureSample, 100, 0)
-            if tex_track:
-                tex_sample.set_editor_property("texture", tex_track)
-            unreal.MaterialEditingLibrary.connect_material_expressions(add_node, "", tex_sample, "Coordinates")
-
-            # Connect to Base Color of Material
-            unreal.MaterialEditingLibrary.connect_material_property(tex_sample, "RGB", unreal.MaterialProperty.MP_BASE_COLOR)
-            unreal.MaterialEditingLibrary.recompile_material(mat_track)
-            editor_asset_lib.save_asset(f"{dest_path}/mat_60")
-            print("Successfully wired TrackOffset UV scroll in mat_60!")
-
-    # 3. Assign materials to the StaticMeshes
-    for name, mesh in imported_meshes.items():
-        if not isinstance(mesh, unreal.StaticMesh):
-            continue
-        if name == "ztz88a_tracks":
-            if mat_track:
-                mesh.set_material(0, mat_track)
-                print(f"Assigned mat_60 to {name}")
-        else:
-            if mat_hull:
-                mesh.set_material(0, mat_hull)
-                print(f"Assigned mat_61 to {name}")
-        editor_asset_lib.save_asset(f"{dest_path}/{name}")
-
-    print("=== [Tank Setup] All assets configured and saved successfully! ===")
 
 if __name__ == "__main__":
-    setup_tank_assets()
+    main()

@@ -9,6 +9,20 @@
 #include "Materials/MaterialInstanceDynamic.h"
 #include "DrawDebugHelpers.h"
 #include "UObject/ConstructorHelpers.h"
+#include "EnhancedInputComponent.h"
+#include "EnhancedInputSubsystems.h"
+#include "InputAction.h"
+#include "InputMappingContext.h"
+#include "InputModifiers.h"
+
+namespace
+{
+	// 负重轮滚动半径（cm），均匀 z_span 69.8/2；Y 取 144 让轮盘端面退到履带
+	// 外侧面（Y≈171）之后 ~3cm，避免旋转时与履带侧面 z-fighting 闪烁
+	constexpr float RoadWheelRollRadius = 35.0f;
+	constexpr float RoadWheelY = 144.0f;
+	constexpr float RoadWheelZ = 41.75f;
+}
 
 ATankPawn::ATankPawn()
 {
@@ -28,7 +42,7 @@ ATankPawn::ATankPawn()
 	HullMesh->SetRelativeScale3D(FVector::OneVector);
 	HullMesh->SetCollisionProfileName(TEXT("NoCollision"));
 
-	static ConstructorHelpers::FObjectFinder<UStaticMesh> HullMeshAsset(TEXT("/Game/tank/ztz-88a/ztz88a_hull.ztz88a_hull"));
+	static ConstructorHelpers::FObjectFinder<UStaticMesh> HullMeshAsset(TEXT("/Game/tank/ztz-88a/ztz88a_hull_body.ztz88a_hull_body"));
 	if (HullMeshAsset.Succeeded())
 	{
 		HullMesh->SetStaticMesh(HullMeshAsset.Object);
@@ -41,11 +55,56 @@ ATankPawn::ATankPawn()
 	TracksMesh->SetRelativeScale3D(FVector::OneVector);
 	TracksMesh->SetCollisionProfileName(TEXT("NoCollision"));
 
-	static ConstructorHelpers::FObjectFinder<UStaticMesh> TracksMeshAsset(TEXT("/Game/tank/ztz-88a/ztz88a_tracks.ztz88a_tracks"));
+	static ConstructorHelpers::FObjectFinder<UStaticMesh> TracksMeshAsset(TEXT("/Game/tank/ztz-88a/ztz88a_tracks_full.ztz88a_tracks_full"));
 	if (TracksMeshAsset.Succeeded())
 	{
 		TracksMesh->SetStaticMesh(TracksMeshAsset.Object);
 	}
+
+	// 3b. 负重轮（每侧 6 个，位于履带环内）——由 split_tank_mesh.py 从车体网格拆出
+	// 布局来自脚本输出：loc=(X, ±147.72, 41.75)，滚动半径 35cm（相对 TracksMesh 坐标系）
+	struct FRoadWheelSetup
+	{
+		const TCHAR* MeshPath;
+		float X;
+		bool bRightSide;
+	};
+	const FRoadWheelSetup RoadSetups[] =
+	{
+		{ TEXT("/Game/tank/ztz-88a/ztz88a_road_r0.ztz88a_road_r0"), -206.00f, true },
+		{ TEXT("/Game/tank/ztz-88a/ztz88a_road_r1.ztz88a_road_r1"), -131.00f, true },
+		{ TEXT("/Game/tank/ztz-88a/ztz88a_road_r2.ztz88a_road_r2"),  -56.00f, true },
+		{ TEXT("/Game/tank/ztz-88a/ztz88a_road_r3.ztz88a_road_r3"),   19.00f, true },
+		{ TEXT("/Game/tank/ztz-88a/ztz88a_road_r4.ztz88a_road_r4"),  107.50f, true },
+		{ TEXT("/Game/tank/ztz-88a/ztz88a_road_r5.ztz88a_road_r5"),  199.95f, true },
+		{ TEXT("/Game/tank/ztz-88a/ztz88a_road_l0.ztz88a_road_l0"), -206.00f, false },
+		{ TEXT("/Game/tank/ztz-88a/ztz88a_road_l1.ztz88a_road_l1"), -131.00f, false },
+		{ TEXT("/Game/tank/ztz-88a/ztz88a_road_l2.ztz88a_road_l2"),  -56.00f, false },
+		{ TEXT("/Game/tank/ztz-88a/ztz88a_road_l3.ztz88a_road_l3"),   19.00f, false },
+		{ TEXT("/Game/tank/ztz-88a/ztz88a_road_l4.ztz88a_road_l4"),  107.50f, false },
+		{ TEXT("/Game/tank/ztz-88a/ztz88a_road_l5.ztz88a_road_l5"),  199.95f, false },
+	};
+	RoadWheels.Reserve(UE_ARRAY_COUNT(RoadSetups));
+	RoadWheelAngles.Init(0.0f, UE_ARRAY_COUNT(RoadSetups));
+	for (int32 i = 0; i < UE_ARRAY_COUNT(RoadSetups); ++i)
+	{
+		UStaticMeshComponent* WheelComp = CreateDefaultSubobject<UStaticMeshComponent>(
+			*FString::Printf(TEXT("RoadWheel%d"), i));
+		WheelComp->SetupAttachment(TracksMesh);
+		WheelComp->SetRelativeLocation(FVector(RoadSetups[i].X,
+			RoadSetups[i].bRightSide ? RoadWheelY : -RoadWheelY, RoadWheelZ));
+		WheelComp->SetCollisionProfileName(TEXT("NoCollision"));
+
+		ConstructorHelpers::FObjectFinder<UStaticMesh> WheelMeshAsset(RoadSetups[i].MeshPath);
+		if (WheelMeshAsset.Succeeded())
+		{
+			WheelComp->SetStaticMesh(WheelMeshAsset.Object);
+		}
+		RoadWheels.Add(WheelComp);
+	}
+
+	// 3c. 端轮说明：主动轮/诱导轮盘体在车体网格内、被履带包绕覆盖，不做独立
+	// 旋转组件（此前尝试拆出旋转端轮会带出履带弧块，见 split_tank_mesh.py 注释）
 
 	// 4. 炮塔水平旋转轴心 (挂在车身上，坐标：X=-2.5, Y=0, Z=145.5)
 	TurretPivot = CreateDefaultSubobject<USceneComponent>(TEXT("TurretPivot"));
@@ -109,6 +168,34 @@ ATankPawn::ATankPawn()
 
 	AutoPossessPlayer = EAutoReceiveInput::Player0;
 	ProjectileClass = ATankProjectile::StaticClass();
+
+	// 10. Enhanced Input：动作与映射上下文资产位于 /Game/tank/inputs/（MCP 创建）
+	static ConstructorHelpers::FObjectFinder<UInputMappingContext> IMCAsset(TEXT("/Game/tank/inputs/IMC_Tank.IMC_Tank"));
+	if (IMCAsset.Succeeded())
+	{
+		DefaultMappingContext = IMCAsset.Object;
+	}
+
+	const std::pair<const TCHAR*, TObjectPtr<UInputAction>*> InputAssets[] =
+	{
+		{ TEXT("/Game/tank/inputs/IA_MoveForward.IA_MoveForward"), &MoveForwardAction },
+		{ TEXT("/Game/tank/inputs/IA_MoveBackward.IA_MoveBackward"), &MoveBackwardAction },
+		{ TEXT("/Game/tank/inputs/IA_TurnRight.IA_TurnRight"), &TurnRightAction },
+		{ TEXT("/Game/tank/inputs/IA_TurnLeft.IA_TurnLeft"), &TurnLeftAction },
+		{ TEXT("/Game/tank/inputs/IA_TurretCW.IA_TurretCW"), &TurretCWAction },
+		{ TEXT("/Game/tank/inputs/IA_TurretCCW.IA_TurretCCW"), &TurretCCWAction },
+		{ TEXT("/Game/tank/inputs/IA_CameraYaw.IA_CameraYaw"), &CameraYawAction },
+		{ TEXT("/Game/tank/inputs/IA_GunPitch.IA_GunPitch"), &GunPitchAction },
+		{ TEXT("/Game/tank/inputs/IA_Fire.IA_Fire"), &FireAction },
+	};
+	for (const auto& InputAsset : InputAssets)
+	{
+		ConstructorHelpers::FObjectFinder<UInputAction> ActionAsset(InputAsset.first);
+		if (ActionAsset.Succeeded())
+		{
+			*InputAsset.second = ActionAsset.Object;
+		}
+	}
 }
 
 void ATankPawn::PostRegisterAllComponents()
@@ -159,6 +246,15 @@ void ATankPawn::BeginPlay()
 	}
 
 	UE_LOG(LogTank, Log, TEXT("TankPawn initialized with Vehicle-Relative Camera and Direct Gun Elevation."));
+
+	// 挂载输入映射上下文（Enhanced Input 要求在 BeginPlay/拥有后添加）
+	if (const APlayerController* PC = Cast<APlayerController>(GetController()))
+	{
+		if (UEnhancedInputLocalPlayerSubsystem* Subsystem = ULocalPlayer::GetSubsystem<UEnhancedInputLocalPlayerSubsystem>(PC->GetLocalPlayer()))
+		{
+			Subsystem->AddMappingContext(DefaultMappingContext, 0);
+		}
+	}
 }
 
 void ATankPawn::Tick(float DeltaTime)
@@ -211,7 +307,7 @@ void ATankPawn::Tick(float DeltaTime)
 	}
 	CurrentTurretYaw = FMath::FixedTurn(CurrentTurretYaw, CameraRelativeYaw, TurretRotateSpeed * DeltaTime);
 
-	// 5. 主炮垂直电驱高低机平滑追踪（平滑向鼠标纵向指定的 DesiredGunPitch 靠拢）
+	// 6. 主炮垂直电驱高低机平滑追踪（平滑向鼠标纵向指定的 DesiredGunPitch 靠拢）
 	if (!FMath::IsNearlyZero(CurrentPitchInput))
 	{
 		DesiredGunPitch = FMath::Clamp(DesiredGunPitch + CurrentPitchInput * PitchSpeed * DeltaTime, MinPitch, MaxPitch);
@@ -227,7 +323,7 @@ void ATankPawn::Tick(float DeltaTime)
 		GunPivot->SetRelativeRotation(FRotator(CurrentPitch, 0.0f, 0.0f));
 	}
 
-	// 6. 主炮后坐力渐进平滑复位
+	// 7. 主炮后坐力渐进平滑复位
 	if (GunMesh)
 	{
 		if (CurrentRecoilOffset < -0.01f)
@@ -241,7 +337,28 @@ void ATankPawn::Tick(float DeltaTime)
 		GunMesh->SetRelativeLocation(FVector(CurrentRecoilOffset, 0.0f, 0.0f));
 	}
 
-	// 7. 真实弹道指向与射击点（从炮口沿炮管轴线探测，鼠标纵向调节时清晰上下位移）
+	// 8. 负重轮差速旋转（+Yaw 为右转：右履带减速、左履带加速；轮角速度=履带线速度/滚动半径）
+	if (!FMath::IsNearlyZero(CurrentMoveInput) || !FMath::IsNearlyZero(CurrentTurnInput))
+	{
+		const float YawRateRad = FMath::DegreesToRadians(CurrentTurnInput * TurnSpeed);
+		const float HalfSpan = FMath::Max(1.0f, TrackSpan) * 0.5f;
+		const float TrackSpeedLeft = CurrentMoveInput * MoveSpeed + YawRateRad * HalfSpan;
+		const float TrackSpeedRight = CurrentMoveInput * MoveSpeed - YawRateRad * HalfSpan;
+		const float SpinSign = bInvertWheelSpin ? -1.0f : 1.0f;
+
+		// 负重轮：0-5 为右侧、6-11 为左侧，与所在侧履带线速度一致
+		for (int32 i = 0; i < RoadWheels.Num(); ++i)
+		{
+			const float SideSpeed = (i < 6) ? TrackSpeedRight : TrackSpeedLeft;
+			RoadWheelAngles[i] = FMath::Fmod(RoadWheelAngles[i] + SpinSign * FMath::RadiansToDegrees(SideSpeed / RoadWheelRollRadius) * DeltaTime, 360.0f);
+			if (RoadWheels[i])
+			{
+				RoadWheels[i]->SetRelativeRotation(FRotator(RoadWheelAngles[i], 0.0f, 0.0f));
+			}
+		}
+	}
+
+	// 9. 真实弹道指向与射击点（从炮口沿炮管轴线探测，鼠标纵向调节时清晰上下位移）
 	if (bDrawAimDebug && GetWorld() && GunMesh)
 	{
 		const FVector MuzzleLoc = GunMesh->GetComponentTransform().TransformPosition(FVector(MuzzleForwardOffset, 0.0f, 0.0f));
@@ -272,53 +389,76 @@ void ATankPawn::Tick(float DeltaTime)
 void ATankPawn::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
 {
 	Super::SetupPlayerInputComponent(PlayerInputComponent);
-	check(PlayerInputComponent);
 
-	// 基础驱动与差速掉头
-	PlayerInputComponent->BindAxis(TEXT("MoveForward"), this, &ATankPawn::MoveForwardInput);
-	PlayerInputComponent->BindAxis(TEXT("Turn"), this, &ATankPawn::TurnInput);
-
-	// 现代商业标杆视口与射击点控制
-	PlayerInputComponent->BindAxis(TEXT("TurnCamera"), this, &ATankPawn::TurnCameraInput);
-	PlayerInputComponent->BindAxis(TEXT("LookUpCamera"), this, &ATankPawn::LookUpCameraInput);
-
-	// 主炮开火
-	PlayerInputComponent->BindAction(TEXT("Fire"), IE_Pressed, this, &ATankPawn::FireInput);
-
-	// 键盘微调兼容
-	PlayerInputComponent->BindAxis(TEXT("TurretRotate"), this, &ATankPawn::TurretRotateInput);
-	PlayerInputComponent->BindAxis(TEXT("PitchGun"), this, &ATankPawn::PitchUpInput);
-}
-
-void ATankPawn::MoveForwardInput(float Value)
-{
-	CurrentMoveInput = Value;
-}
-
-void ATankPawn::TurnInput(float Value)
-{
-	CurrentTurnInput = Value;
-}
-
-void ATankPawn::TurnCameraInput(float Value)
-{
-	if (!FMath::IsNearlyZero(Value))
+	UEnhancedInputComponent* EnhancedInput = Cast<UEnhancedInputComponent>(PlayerInputComponent);
+	if (!EnhancedInput)
 	{
-		CameraRelativeYaw = FRotator::NormalizeAxis(CameraRelativeYaw + Value * CameraSensitivityX);
+		UE_LOG(LogTank, Error, TEXT("Missing EnhancedInputComponent — check DefaultInput.ini DefaultInputComponentClass."));
+		return;
+	}
+
+	EnhancedInput->BindAction(MoveForwardAction, ETriggerEvent::Triggered, this, &ATankPawn::MoveForward);
+	EnhancedInput->BindAction(MoveBackwardAction, ETriggerEvent::Triggered, this, &ATankPawn::MoveBackward);
+	EnhancedInput->BindAction(TurnRightAction, ETriggerEvent::Triggered, this, &ATankPawn::TurnRight);
+	EnhancedInput->BindAction(TurnLeftAction, ETriggerEvent::Triggered, this, &ATankPawn::TurnLeft);
+	EnhancedInput->BindAction(TurretCWAction, ETriggerEvent::Triggered, this, &ATankPawn::TurretCW);
+	EnhancedInput->BindAction(TurretCCWAction, ETriggerEvent::Triggered, this, &ATankPawn::TurretCCW);
+	EnhancedInput->BindAction(CameraYawAction, ETriggerEvent::Triggered, this, &ATankPawn::OrbitCamera);
+	EnhancedInput->BindAction(GunPitchAction, ETriggerEvent::Triggered, this, &ATankPawn::ElevateGun);
+	EnhancedInput->BindAction(FireAction, ETriggerEvent::Started, this, &ATankPawn::Fire);
+}
+
+void ATankPawn::MoveForward()
+{
+	CurrentMoveInput = 1.0f;
+}
+
+void ATankPawn::MoveBackward()
+{
+	CurrentMoveInput = -1.0f;
+}
+
+void ATankPawn::TurnRight()
+{
+	CurrentTurnInput = 1.0f;
+}
+
+void ATankPawn::TurnLeft()
+{
+	CurrentTurnInput = -1.0f;
+}
+
+void ATankPawn::TurretCW()
+{
+	CurrentTurretRotateInput = 1.0f;
+}
+
+void ATankPawn::TurretCCW()
+{
+	CurrentTurretRotateInput = -1.0f;
+}
+
+void ATankPawn::OrbitCamera(const FInputActionValue& Value)
+{
+	const float Axis = Value.Get<float>();
+	if (!FMath::IsNearlyZero(Axis))
+	{
+		CameraRelativeYaw = FRotator::NormalizeAxis(CameraRelativeYaw + Axis * CameraSensitivityX);
 	}
 }
 
-void ATankPawn::LookUpCameraInput(float Value)
+void ATankPawn::ElevateGun(const FInputActionValue& Value)
 {
-	if (!FMath::IsNearlyZero(Value))
+	const float Axis = Value.Get<float>();
+	if (!FMath::IsNearlyZero(Axis))
 	{
 		// 鼠标向上推 -> 仰角增大(向上抬)；鼠标向下拉 -> 仰角减小(向下压)
 		const float Direction = bInvertPitch ? -1.0f : 1.0f;
-		DesiredGunPitch = FMath::Clamp(DesiredGunPitch + Value * PitchSensitivity * Direction, MinPitch, MaxPitch);
+		DesiredGunPitch = FMath::Clamp(DesiredGunPitch + Axis * PitchSensitivity * Direction, MinPitch, MaxPitch);
 	}
 }
 
-void ATankPawn::FireInput()
+void ATankPawn::Fire()
 {
 	UWorld* World = GetWorld();
 	if (!World) return;
@@ -357,14 +497,4 @@ void ATankPawn::FireInput()
 
 	UE_LOG(LogTank, Log, TEXT("[Tank] FIRE! MuzzleLoc=(%.1f, %.1f, %.1f), Reloading %.1fs"),
 		MuzzleLoc.X, MuzzleLoc.Y, MuzzleLoc.Z, FireCooldown);
-}
-
-void ATankPawn::TurretRotateInput(float Value)
-{
-	CurrentTurretRotateInput = Value;
-}
-
-void ATankPawn::PitchUpInput(float Value)
-{
-	CurrentPitchInput = Value;
 }
