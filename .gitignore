@@ -31,3 +31,8 @@ Build/
 # OS specific files
 .DS_Store
 Thumbs.db
+
+# Editor / Agent configs
+.agents/
+.vscode/
+.idea/
