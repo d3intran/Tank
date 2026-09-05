@@ -29,6 +29,14 @@
 		{
 			"Name": "EditorToolset",
 			"Enabled": true
+		},
+		{
+			"Name": "PythonEditorScriptPlugin",
+			"Enabled": true
+		},
+		{
+			"Name": "EditorScriptingUtilities",
+			"Enabled": true
 		}
 	]
 }
