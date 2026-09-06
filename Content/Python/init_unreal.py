@@ -40,7 +40,7 @@ def _execute(payload):
     return {"ok": False, "result": "", "error": f"unknown type: {cmd_type}"}
 
 
-def _poll():
+def _poll(_delta_time=0.0):
     _ensure_dirs()
     try:
         files = [f for f in os.listdir(QUEUE_DIR) if f.endswith(".json")]
