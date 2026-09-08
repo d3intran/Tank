@@ -40,26 +40,37 @@ def _execute(payload):
     return {"ok": False, "result": "", "error": f"unknown type: {cmd_type}"}
 
 
+_busy = False
+
+
 def _poll(_delta_time=0.0):
-    _ensure_dirs()
-    try:
-        files = [f for f in os.listdir(QUEUE_DIR) if f.endswith(".json")]
-    except OSError:
+    global _busy
+    if _busy:
         return
-    for name in files:
-        queue_path = os.path.join(QUEUE_DIR, name)
+    _busy = True
+    try:
+        started = time.time()
+        _ensure_dirs()
         try:
-            with open(queue_path, encoding="utf-8") as fh:
-                payload = json.load(fh)
-        except (OSError, ValueError) as exc:
-            result = {"ok": False, "result": "", "error": f"bad payload: {exc}"}
-        else:
-            result = _execute(payload)
-        result["elapsed_ms"] = int((time.time() - started) * 1000)
-        result_path = os.path.join(RESULTS_DIR, name)
-        with open(result_path, "w", encoding="utf-8") as fh:
-            json.dump(result, fh, ensure_ascii=False)
-        os.remove(queue_path)
+            files = [f for f in os.listdir(QUEUE_DIR) if f.endswith(".json")]
+        except OSError:
+            return
+        for name in files:
+            queue_path = os.path.join(QUEUE_DIR, name)
+            try:
+                with open(queue_path, encoding="utf-8") as fh:
+                    payload = json.load(fh)
+                os.remove(queue_path)
+            except (OSError, ValueError) as exc:
+                result = {"ok": False, "result": "", "error": f"bad payload: {exc}"}
+            else:
+                result = _execute(payload)
+            result["elapsed_ms"] = int((time.time() - started) * 1000)
+            result_path = os.path.join(RESULTS_DIR, name)
+            with open(result_path, "w", encoding="utf-8") as fh:
+                json.dump(result, fh, ensure_ascii=False)
+    finally:
+        _busy = False
 
 
 def _bootstrap():

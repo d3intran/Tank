@@ -85,7 +85,7 @@ protected:
 	// Movement Parameters
 	// ==========================================
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tank|Movement", meta = (ClampMin = "0.0", UIMin = "0.0", Units = "cm/s"))
-	float MoveSpeed = 800.0f;
+	float MoveSpeed = 1600.0f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tank|Movement", meta = (ClampMin = "0.0", UIMin = "0.0", Units = "deg/s"))
 	float TurnSpeed = 60.0f;
@@ -103,7 +103,7 @@ protected:
 	// Turret & Gun Parameters (电驱伺服机械平滑追踪与双向稳定)
 	// ==========================================
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tank|Turret", meta = (ClampMin = "1.0", UIMin = "5.0", UIMax = "120.0", Units = "deg/s"))
-	float TurretRotateSpeed = 35.0f; // 商业标杆：主战坦克电动座圈角速度 35°/s
+	float TurretRotateSpeed = 70.0f; // 炮塔回转角速度（2× 灵敏度，基准 35°/s）
 
 	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Category = "Tank|Turret")
 	float CurrentTurretYaw = 0.0f;

@@ -30,7 +30,8 @@ ATankPawn::ATankPawn()
 
 	// 1. 根碰撞盒：根据 1:1 真实尺寸（长7.6m, 宽3.5m, 高2.4m）
 	CollisionBox = CreateDefaultSubobject<UBoxComponent>(TEXT("CollisionBox"));
-	CollisionBox->SetBoxExtent(FVector(380.0f, 175.0f, 120.0f));
+	// 高度 240→236：盒底相对车体抬升 2cm 安全间隙——与齐平路面/地板共面时避免毫米级穿透导致扫掠卡死
+	CollisionBox->SetBoxExtent(FVector(380.0f, 175.0f, 118.0f));
 	CollisionBox->SetCollisionProfileName(TEXT("Pawn"));
 	CollisionBox->SetSimulatePhysics(false);
 	RootComponent = CollisionBox;
@@ -275,7 +276,7 @@ void ATankPawn::Tick(float DeltaTime)
 		}
 	}
 
-	// 2. WASD 原地差速掉头
+	// 2. WASD 原地差速掉头（坦克约定：A/D 恒定转向车体，与前后进无关，倒车不反向）
 	if (!FMath::IsNearlyZero(CurrentTurnInput))
 	{
 		const FRotator TurnDelta = FRotator(0.0f, CurrentTurnInput * TurnSpeed * DeltaTime, 0.0f);
