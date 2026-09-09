@@ -1,11 +1,13 @@
 #include "TankProjectile.h"
 #include "Tank.h"
+#include "Zombie.h"
 #include "Components/SphereComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "GameFramework/ProjectileMovementComponent.h"
 #include "DrawDebugHelpers.h"
 #include "UObject/ConstructorHelpers.h"
 #include "Kismet/GameplayStatics.h"
+#include "EngineUtils.h"
 
 ATankProjectile::ATankProjectile()
 {
@@ -15,6 +17,9 @@ ATankProjectile::ATankProjectile()
 	CollisionSphere = CreateDefaultSubobject<USphereComponent>(TEXT("CollisionSphere"));
 	CollisionSphere->InitSphereRadius(15.0f);
 	CollisionSphere->SetCollisionProfileName(TEXT("BlockAllDynamic"));
+	// 显式对丧尸自定义通道 Block：profile 对未命名 GameTrace 通道的响应不可靠，
+	// 缺这行炮弹会直穿丧尸本体（只在打地/打墙时溅射杀伤）
+	CollisionSphere->SetCollisionResponseToChannel(ECC_GameTraceChannel1, ECR_Block);
 	CollisionSphere->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
 	CollisionSphere->SetNotifyRigidBodyCollision(true);
 	CollisionSphere->OnComponentHit.AddDynamic(this, &ATankProjectile::OnHit);
@@ -74,6 +79,25 @@ void ATankProjectile::OnHit(UPrimitiveComponent* HitComp, AActor* OtherActor, UP
 	if (OtherActor)
 	{
 		UGameplayStatics::ApplyPointDamage(OtherActor, Damage, GetVelocity().GetSafeNormal(), Hit, GetInstigatorController(), this, nullptr);
+	}
+
+	// P1 溅射：落点径向杀伤尸群（半半径内全额击杀，外圈 0.3× 打残；P2 迁 Mass 后由空间索引取代遍历）
+	if (UWorld* World = GetWorld())
+	{
+		for (TActorIterator<AZombie> ZombieIt(World); ZombieIt; ++ZombieIt)
+		{
+			AZombie* Zombie = *ZombieIt;
+			if (!Zombie || Zombie->IsDead())
+			{
+				continue;
+			}
+			const float Dist2D = FVector::Dist2D(Zombie->GetActorLocation(), Hit.ImpactPoint);
+			if (Dist2D <= ExplosionRadius)
+			{
+				const float SplashDamage = Dist2D <= ExplosionRadius * 0.5f ? Damage : Damage * 0.3f;
+				UGameplayStatics::ApplyPointDamage(Zombie, SplashDamage, GetVelocity().GetSafeNormal(), Hit, GetInstigatorController(), this, nullptr);
+			}
+		}
 	}
 
 	UE_LOG(LogTank, Log, TEXT("[TankProjectile] Hit: %s at %s"), 
