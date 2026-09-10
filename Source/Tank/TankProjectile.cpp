@@ -11,6 +11,10 @@ ATankProjectile::ATankProjectile()
 {
 	PrimaryActorTick.bCanEverTick = false;
 
+	// M2 联机：炮弹只在服务器生成与模拟，复制位姿给各客户端看弹道
+	bReplicates = true;
+	SetReplicateMovement(true);
+
 	// 1. 碰撞体（根组件）
 	CollisionSphere = CreateDefaultSubobject<USphereComponent>(TEXT("CollisionSphere"));
 	CollisionSphere->InitSphereRadius(15.0f);
@@ -53,6 +57,12 @@ void ATankProjectile::BeginPlay()
 
 void ATankProjectile::OnHit(UPrimitiveComponent* HitComp, AActor* OtherActor, UPrimitiveComponent* OtherComp, FVector NormalImpulse, const FHitResult& Hit)
 {
+	// M2：命中判定/伤害/销毁全部服务器独占；客户端的复制弹体只做视觉，等服务器销毁复制过来
+	if (!HasAuthority())
+	{
+		return;
+	}
+
 	// 忽略与发射者（自身坦克）的自相碰撞
 	if (OtherActor && (OtherActor == this || OtherActor == GetOwner() || OtherActor == GetInstigator()))
 	{

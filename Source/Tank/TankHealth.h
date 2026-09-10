@@ -19,7 +19,9 @@ class TANK_API UTankHealth : public UActorComponent
 public:
 	UTankHealth();
 
-	// 扣血入口。返回扣后剩余值，已耗尽时幂等返回 0
+	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+
+	// 扣血入口。返回扣后剩余值，已耗尽时幂等返回 0。仅服务器调用（炮弹命中在服务器判定）
 	float ApplyDamage(float DamageAmount);
 
 	FORCEINLINE float GetCurrentHealth() const { return CurrentHealth; }
@@ -35,10 +37,16 @@ public:
 protected:
 	virtual void BeginPlay() override;
 
+	UFUNCTION()
+	void OnRep_CurrentHealth();
+
 	// 血量 1000：炮弹直击 250 → 4 发击毁（灰盒基准，M4 平衡时调）
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tank|Health", meta = (AllowPrivateAccess = "true", ClampMin = "1.0", UIMin = "100.0"))
 	float MaxHealth = 1000.0f;
 
+	// 复制血量：服务器 ApplyDamage 后所有端 OnRep 收敛（M2 DoD"血量全员一致"的数据通道）
+	UPROPERTY(ReplicatedUsing = OnRep_CurrentHealth)
 	float CurrentHealth = 0.0f;
+
 	bool bDepleted = false;
 };

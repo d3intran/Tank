@@ -1,6 +1,7 @@
 #include "BattleGameMode.h"
 #include "Tank.h"
 #include "TankPawn.h"
+#include "BattleHUD.h"
 #include "GameFramework/PlayerStart.h"
 #include "GameFramework/PlayerController.h"
 #include "EngineUtils.h"
@@ -8,6 +9,7 @@
 ABattleGameMode::ABattleGameMode()
 {
 	DefaultPawnClass = ATankPawn::StaticClass();
+	HUDClass = ABattleHUD::StaticClass();
 }
 
 void ABattleGameMode::BeginPlay()
@@ -31,51 +33,18 @@ void ABattleGameMode::PostLogin(APlayerController* NewPlayer)
 
 void ABattleGameMode::EnsureAllPlayersHavePawns()
 {
-	// 三段式巡检（PIE 多开下主机玩家会被引擎解除占有，且孤儿车会堵死出生点）：
-	// 1) 占有脱钩（PC 有 Pawn 引用但 Pawn->Controller 已空）→ 直接 Possess 收编，免重生
-	// 2) 彻底无 Pawn → 标准 RestartPlayer 补发（配合下方 SpawnDefaultPawnFor 的 Adjust 碰撞处理）
-	// 3) 清理无主 Pawn，防止孤儿车越积越多
-	TArray<APlayerController*> PCs;
+	// 单段巡检：只对「GetPawn 为空」的玩家调 RestartPlayer。
+	// 引擎 RestartPlayerAtPlayerStart 对 GetPawn 非空（占有脱钩）的玩家会直接重新 Possess 旧 Pawn，
+	// 自带收编能力——不要跨 PC 抢Possess、不要销毁"无主"Pawn（三段式版本会互相打架：
+	// 收编触发对方的 UnPossessed、清理销毁引擎正在重挂的坦克，玩家陷入永久重生循环）
 	for (TActorIterator<APlayerController> It(GetWorld()); It; ++It)
 	{
-		if (*It && !(*It)->IsPendingKillPending())
-		{
-			PCs.Add(*It);
-		}
-	}
-
-	for (APlayerController* PC : PCs)
-	{
-		APawn* P = PC->GetPawn();
-		if (P && P->GetController() != PC)
-		{
-			UE_LOG(LogTank, Warning, TEXT("[Battle] %s 占有脱钩，收编孤儿 %s"),
-				*PC->GetHumanReadableName(), *P->GetName());
-			PC->Possess(P);
-		}
-	}
-
-	for (APlayerController* PC : PCs)
-	{
-		if (!PC->GetPawn())
+		APlayerController* PC = *It;
+		if (PC && !PC->IsPendingKillPending() && !PC->GetPawn())
 		{
 			UE_LOG(LogTank, Warning, TEXT("[Battle] %s 无 Pawn，补发"), *PC->GetHumanReadableName());
 			RestartPlayer(PC);
 		}
-	}
-
-	TArray<APawn*> Orphans;
-	for (TActorIterator<APawn> It(GetWorld()); It; ++It)
-	{
-		if (*It && !(*It)->IsPendingKillPending() && It->GetController() == nullptr)
-		{
-			Orphans.Add(*It);
-		}
-	}
-	for (APawn* Orphan : Orphans)
-	{
-		UE_LOG(LogTank, Warning, TEXT("[Battle] 清理无主 Pawn %s"), *Orphan->GetName());
-		Orphan->Destroy();
 	}
 }
 
@@ -106,8 +75,9 @@ void ABattleGameMode::Logout(AController* Exiting)
 
 AActor* ABattleGameMode::ChoosePlayerStart_Implementation(AController* Player)
 {
-	// 轮转分配：ChoosePlayerStart 在 Login 期调用，此时 GetNumPlayers() 尚未含新玩家，
-	// 按已入场人数取模保证三人各占一点——引擎默认按评分选点会重复选同一点导致坦克叠罗汉
+	// FFA 选点：取「距所有存活坦克最远」的出生点。
+	// 不可用轮转——固定人数下轮转恒落同一点，重生叠在活坦克上会触发物理穿透解算，
+	// 把对方硬挤飞，观感就是"自己被瞬移到重生点"
 	TArray<APlayerStart*> Starts;
 	for (TActorIterator<APlayerStart> It(GetWorld()); It; ++It)
 	{
@@ -117,5 +87,31 @@ AActor* ABattleGameMode::ChoosePlayerStart_Implementation(AController* Player)
 	{
 		return Super::ChoosePlayerStart(Player);
 	}
-	return Starts[GetNumPlayers() % Starts.Num()];
+
+	TArray<FVector> TankLocs;
+	for (TActorIterator<ATankPawn> It(GetWorld()); It; ++It)
+	{
+		ATankPawn* Tank = *It;
+		if (Tank && Tank->GetController() && Tank->GetController() != Player)
+		{
+			TankLocs.Add(Tank->GetActorLocation());
+		}
+	}
+
+	APlayerStart* Best = nullptr;
+	float BestScore = -1.0f;
+	for (APlayerStart* Start : Starts)
+	{
+		float MinDist = TankLocs.Num() > 0 ? FLT_MAX : 0.0f;
+		for (const FVector& Loc : TankLocs)
+		{
+			MinDist = FMath::Min(MinDist, FVector::Dist2D(Start->GetActorLocation(), Loc));
+		}
+		if (MinDist > BestScore)
+		{
+			BestScore = MinDist;
+			Best = Start;
+		}
+	}
+	return Best ? Best : Super::ChoosePlayerStart(Player);
 }

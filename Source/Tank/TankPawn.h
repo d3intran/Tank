@@ -25,6 +25,8 @@ public:
 	ATankPawn();
 
 	virtual void Tick(float DeltaTime) override;
+	virtual float TakeDamage(float DamageAmount, FDamageEvent const& DamageEvent,
+		AController* EventInstigator, AActor* DamageCauser) override;
 	virtual void SetupPlayerInputComponent(class UInputComponent* PlayerInputComponent) override;
 protected:
 	virtual void PostRegisterAllComponents() override;
@@ -233,10 +235,24 @@ private:
 	void ElevateGun(const FInputActionValue& Value);
 	void Fire();
 
-	// M1 客户端权威移动同步：本机客户端 20Hz 上报位姿，服务器应用后经 bReplicateMovement 转发其他端。
+	// M1 客户端权威移动同步：本机客户端 50Hz 上报位姿，服务器应用后经移动复制转发其他端。
 	// Unreliable：位置流，丢一包下一包就补上，不需要可靠重传
-	UFUNCTION(Server, Unreliable)
+	UFUNCTION(Server, Unreliable, WithValidation)
 	void ServerSyncTransform(const FVector_NetQuantize100& Location, const FRotator& NetRotation);
+
+	// M2 服务端权威开火：客户端只报炮口位姿（炮塔俯仰是本机状态，服务器不知道），
+	// 炮弹生成/模拟/命中判定全部服务器独占；表现（后坐力/弹道闪）走 Multicast
+	UFUNCTION(Server, Reliable, WithValidation)
+	void ServerFire(FVector_NetQuantize100 MuzzleLoc, FVector_NetQuantizeNormal AimDir);
+
+	UFUNCTION(NetMulticast, Unreliable)
+	void MulticastFireFX(FVector_NetQuantize100 MuzzleLoc, FVector_NetQuantizeNormal AimDir);
+
+	UFUNCTION(NetMulticast, Reliable)
+	void MulticastDeathFX(FVector_NetQuantize100 DeathLoc);
+
+	void ExecuteFire(const FVector& MuzzleLoc, const FVector& AimDir);
+	void HandleDeath(AController* Killer);
 
 	// M1.5 挤压推进：本机扫掠被对方坦克挡住时，把对方沿推进方向顶开。
 	// 路由：服务器判被推端归属——主机自有直接应用，客户端自有走 Client RPC 让其所有者本地应用
@@ -264,7 +280,6 @@ private:
 	float TransformSyncInterval = 0.02f;
 
 	float LastTransformSyncTime = -1000.0f;
-	float LastNetLogTime = 0.0f;
 	bool bMappingContextAdded = false;
 
 	// 待消化的被推位移（本地累积，Tick 恒速消耗；不复制——被推端本地应用后经常规位姿上报收敛）

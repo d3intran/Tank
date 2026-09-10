@@ -310,8 +310,8 @@ void ATankPawn::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
 
-	// M1 客户端权威移动同步：本机客户端模拟 → 20Hz 上报服务器 →
-	// 服务器 SetActorLocationAndRotation 后经 bReplicateMovement 转发其他端。
+	// M1 客户端权威移动同步：本机客户端模拟 → 50Hz 上报服务器 →
+	// 服务器 SetActorLocationAndRotation 后经移动复制转发其他端。
 	// 主机端（Authority）直接本地模拟，无需上报
 	if (IsLocallyControlled() && !HasAuthority())
 	{
@@ -320,14 +320,6 @@ void ATankPawn::Tick(float DeltaTime)
 		{
 			LastTransformSyncTime = Now;
 			ServerSyncTransform(GetActorLocation(), GetActorRotation());
-
-			// M1 联调日志（每 2s 一条，M2 移除）
-			if (Now - LastNetLogTime >= 2.0f)
-			{
-				LastNetLogTime = Now;
-				UE_LOG(LogTank, Log, TEXT("[M1] %s send @ %s Role=%d"),
-					*GetName(), *GetActorLocation().ToCompactString(), (int32)GetLocalRole());
-			}
 		}
 	}
 
@@ -562,31 +554,122 @@ void ATankPawn::Fire()
 
 	LastFireTime = CurrentTime;
 
-	// 1. 触发主炮液压后坐力冲压
+	// 1. 触发主炮液压后坐力冲压（本机表现即时预测，其他端由 MulticastFireFX 补齐）
 	CurrentRecoilOffset = RecoilDistance;
 	if (GunMesh)
 	{
 		GunMesh->SetRelativeLocation(FVector(CurrentRecoilOffset, 0.0f, 0.0f));
 	}
 
-	// 2. 计算炮口世界生成位置（相对 GunMesh 前方 456cm 处）
+	// 2. 炮口世界位姿（炮塔俯仰是本机状态，服务器不知道——随 RPC 上报，灰盒接受其作弊面）
 	const FVector MuzzleLoc = GunMesh ? GunMesh->GetComponentTransform().TransformPosition(FVector(MuzzleForwardOffset, 0.0f, 0.0f)) : GetActorLocation();
-	const FRotator MuzzleRot = GunMesh ? GunMesh->GetComponentRotation() : GetActorRotation();
+	const FVector AimDir = GunMesh ? GunMesh->GetComponentRotation().Vector() : GetActorRotation().Vector();
 
-	// 3. 生成物理炮弹
+	// 3. 炮弹生成服务器独占（双端生成会双重伤害）
+	if (HasAuthority())
+	{
+		ExecuteFire(MuzzleLoc, AimDir);
+	}
+	else
+	{
+		ServerFire(MuzzleLoc, AimDir);
+	}
+
+	// 4. 炮口瞬时开火闪光/示踪线（本机即时，其他端由 Multicast 补）
+	DrawDebugLine(World, MuzzleLoc, MuzzleLoc + AimDir * 3000.0f, FColor::Yellow, false, 0.15f, 0, 4.0f);
+}
+
+void ATankPawn::ExecuteFire(const FVector& MuzzleLoc, const FVector& AimDir)
+{
+	UWorld* World = GetWorld();
+	if (!World) return;
+
 	FActorSpawnParameters SpawnParams;
 	SpawnParams.Owner = this;
 	SpawnParams.Instigator = GetInstigator();
 	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 
 	UClass* ClassToSpawn = ProjectileClass ? ProjectileClass.Get() : ATankProjectile::StaticClass();
-	World->SpawnActor<ATankProjectile>(ClassToSpawn, MuzzleLoc, MuzzleRot, SpawnParams);
+	World->SpawnActor<ATankProjectile>(ClassToSpawn, MuzzleLoc, AimDir.Rotation(), SpawnParams);
 
-	// 4. 炮口瞬时开火闪光/示踪线
-	DrawDebugLine(World, MuzzleLoc, MuzzleLoc + MuzzleRot.Vector() * 3000.0f, FColor::Yellow, false, 0.15f, 0, 4.0f);
+	UE_LOG(LogTank, Log, TEXT("[Battle] %s 开火 @ (%.0f,%.0f,%.0f)"),
+		*GetName(), MuzzleLoc.X, MuzzleLoc.Y, MuzzleLoc.Z);
+}
 
-	UE_LOG(LogTank, Log, TEXT("[Tank] FIRE! MuzzleLoc=(%.1f, %.1f, %.1f), Reloading %.1fs"),
-		MuzzleLoc.X, MuzzleLoc.Y, MuzzleLoc.Z, FireCooldown);
+bool ATankPawn::ServerFire_Validate(FVector_NetQuantize100 MuzzleLoc, FVector_NetQuantizeNormal AimDir)
+{
+	const FVector Loc(MuzzleLoc);
+	const FVector Dir(AimDir);
+	return !Loc.ContainsNaN() && !Dir.ContainsNaN() && !Dir.IsNearlyZero();
+}
+
+void ATankPawn::ServerFire_Implementation(FVector_NetQuantize100 MuzzleLoc, FVector_NetQuantizeNormal AimDir)
+{
+	// 服务器侧宽松射速限制（容忍网络延迟下的合法连发，拦截无脑刷弹）
+	const float Now = GetWorld()->GetTimeSeconds();
+	if (Now - LastFireTime < FireCooldown * 0.5f)
+	{
+		return;
+	}
+	LastFireTime = Now;
+
+	ExecuteFire(FVector(MuzzleLoc), FVector(AimDir));
+	MulticastFireFX(MuzzleLoc, AimDir);
+}
+
+void ATankPawn::MulticastFireFX_Implementation(FVector_NetQuantize100 MuzzleLoc, FVector_NetQuantizeNormal AimDir)
+{
+	// 远端后坐力动画（所有者本机已在 Fire() 里预测过，重复置位无害）
+	CurrentRecoilOffset = RecoilDistance;
+	if (GunMesh)
+	{
+		GunMesh->SetRelativeLocation(FVector(CurrentRecoilOffset, 0.0f, 0.0f));
+	}
+	if (UWorld* World = GetWorld())
+	{
+		DrawDebugLine(World, MuzzleLoc, FVector(MuzzleLoc) + FVector(AimDir) * 3000.0f, FColor::Yellow, false, 0.15f, 0, 4.0f);
+	}
+}
+
+void ATankPawn::MulticastDeathFX_Implementation(FVector_NetQuantize100 DeathLoc)
+{
+	if (UWorld* World = GetWorld())
+	{
+		// 灰盒爆炸表达：橙红双球驻留 2s（P4 换 Niagara）
+		DrawDebugSphere(World, FVector(DeathLoc), 250.0f, 16, FColor::Orange, true, 2.0f, 0, 6.0f);
+		DrawDebugSphere(World, FVector(DeathLoc) + FVector(0, 0, 120.0f), 150.0f, 16, FColor::Red, true, 2.0f, 0, 4.0f);
+	}
+}
+
+float ATankPawn::TakeDamage(float DamageAmount, FDamageEvent const& DamageEvent,
+	AController* EventInstigator, AActor* DamageCauser)
+{
+	// 伤害只在服务器结算（炮弹命中判定服务器独占，客户端弹体 OnHit 已被门挡掉）
+	if (!HasAuthority() || DamageAmount <= 0.0f || !TankHealth || TankHealth->IsDepleted())
+	{
+		return 0.0f;
+	}
+	const float Remaining = TankHealth->ApplyDamage(DamageAmount);
+	UE_LOG(LogTank, Log, TEXT("[Battle] %s 遭受 %.0f 伤害（余 %.0f/%.0f，来源 %s）"),
+		*GetName(), DamageAmount, Remaining, TankHealth->GetMaxHealth(),
+		DamageCauser ? *DamageCauser->GetName() : TEXT("?"));
+
+	if (TankHealth->IsDepleted())
+	{
+		HandleDeath(EventInstigator);
+	}
+	return DamageAmount;
+}
+
+void ATankPawn::HandleDeath(AController* Killer)
+{
+	const FVector DeathLoc = GetActorLocation();
+	UE_LOG(LogTank, Warning, TEXT("[Battle] %s 被击毁（击杀者 %s），2s 后重生"),
+		*GetName(), Killer ? *Killer->GetName() : TEXT("?"));
+
+	// 先广播表现再销毁；SetLifeSpan 留出 Multicast 的发送窗口，销毁后由占有自愈巡检在 2s 内补发新坦克
+	MulticastDeathFX(DeathLoc);
+	SetLifeSpan(0.2f);
 }
 
 void ATankPawn::ServerSyncTransform_Implementation(const FVector_NetQuantize100& Location, const FRotator& NetRotation)
@@ -594,15 +677,12 @@ void ATankPawn::ServerSyncTransform_Implementation(const FVector_NetQuantize100&
 	// 信任客户端位姿（M1 无反作弊，见计划书）。不走 sweep：客户端本地已做过碰撞解析，
 	// 服务器再 sweep 会因时序差拒绝合法移动；物理状态重置避免与瞬时大步距冲突
 	SetActorLocationAndRotation(FVector(Location), NetRotation, false, nullptr, ETeleportType::ResetPhysics);
+}
 
-	// M1 联调日志（每 2s 一条，M2 移除）
-	const float Now = GetWorld()->GetTimeSeconds();
-	if (Now - LastNetLogTime >= 2.0f)
-	{
-		LastNetLogTime = Now;
-		UE_LOG(LogTank, Log, TEXT("[M1] Server recv %s @ %s"),
-			*GetName(), *GetActorLocation().ToCompactString());
-	}
+bool ATankPawn::ServerSyncTransform_Validate(const FVector_NetQuantize100& Location, const FRotator& NetRotation)
+{
+	const FVector Loc(Location);
+	return !Loc.ContainsNaN() && !NetRotation.ContainsNaN();
 }
 
 // ==================== M1.5 挤压推进 ====================
