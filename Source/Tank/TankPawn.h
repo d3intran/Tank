@@ -6,6 +6,7 @@
 #include "TankPawn.generated.h"
 
 class UBoxComponent;
+class UTankHealth;
 class UStaticMeshComponent;
 class USceneComponent;
 class USpringArmComponent;
@@ -35,6 +36,9 @@ protected:
 	// ==========================================
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Tank|Components")
 	TObjectPtr<UBoxComponent> CollisionBox;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Tank|Components")
+	TObjectPtr<UTankHealth> TankHealth;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Tank|Components")
 	TObjectPtr<UStaticMeshComponent> HullMesh;

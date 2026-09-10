@@ -1,6 +1,7 @@
 #include "TankPawn.h"
 #include "Tank.h"
 #include "TankProjectile.h"
+#include "TankHealth.h"
 #include "Components/BoxComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/SceneComponent.h"
@@ -32,12 +33,13 @@ ATankPawn::ATankPawn()
 	CollisionBox = CreateDefaultSubobject<UBoxComponent>(TEXT("CollisionBox"));
 	// 高度 240→236：盒底相对车体抬升 2cm 安全间隙——与齐平路面/地板共面时避免毫米级穿透导致扫掠卡死
 	CollisionBox->SetBoxExtent(FVector(380.0f, 175.0f, 118.0f));
+	// Pawn profile：Pawn 对 Pawn 默认 Block——FFA 坦克互挡靠它
 	CollisionBox->SetCollisionProfileName(TEXT("Pawn"));
-	// 丧尸在 ECC_GameTraceChannel1：UE 配对规则=最宽容者生效，坦克侧必须显式 Ignore
-	// 才能碾过尸群不减速（碾压判定由丧尸侧距离查询完成）
-	CollisionBox->SetCollisionResponseToChannel(ECC_GameTraceChannel1, ECR_Ignore);
 	CollisionBox->SetSimulatePhysics(false);
 	RootComponent = CollisionBox;
+
+	// 1b. 坦克血量组件（M0 挂载；M2 联机升级 Replicated）
+	TankHealth = CreateDefaultSubobject<UTankHealth>(TEXT("TankHealth"));
 
 	// 2. 车身底盘 Mesh（底部对齐碰撞盒底面 Z=-120）
 	HullMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("HullMesh"));
