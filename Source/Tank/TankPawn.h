@@ -238,6 +238,27 @@ private:
 	UFUNCTION(Server, Unreliable)
 	void ServerSyncTransform(const FVector_NetQuantize100& Location, const FRotator& NetRotation);
 
+	// M1.5 挤压推进：本机扫掠被对方坦克挡住时，把对方沿推进方向顶开。
+	// 路由：服务器判被推端归属——主机自有直接应用，客户端自有走 Client RPC 让其所有者本地应用
+	UFUNCTION(Server, Unreliable, WithValidation)
+	void ServerPushTank(ATankPawn* PushedTank, FVector_NetQuantize10 PushDelta);
+
+	UFUNCTION(Client, Unreliable)
+	void ClientApplyPush(FVector_NetQuantize10 PushDelta);
+
+	void TryPushTank(ATankPawn* HitTank, const FVector& PushDelta);
+	void ExecuteTankPush(ATankPawn* PushedTank, const FVector& PushDelta);
+	void ApplyPushDelta(const FVector& PushDelta);
+
+	// 挤压推力倍率：1=顶车即以本机推进速度推走对方，0=关闭挤压
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Net", meta = (AllowPrivateAccess = "true", ClampMin = "0.0", ClampMax = "2.0"))
+	float PushStrength = 1.0f;
+
+	// 被推位移消化速度（cm/s）：推挤 RPC 按推动方帧率到达，节奏差会造成跳帧；
+	// 到达的推挤量累积进 PendingPushOffset，按此恒定速度平滑消化
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Net", meta = (AllowPrivateAccess = "true", ClampMin = "100.0", ClampMax = "3000.0", Units = "cm/s"))
+	float PushConsumeSpeed = 1200.0f;
+
 	// 上报间隔（秒）。20ms=50Hz：PIE 单进程下接近每帧同步；真插值缓冲留 M4
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Net", meta = (AllowPrivateAccess = "true", ClampMin = "0.02", ClampMax = "0.5"))
 	float TransformSyncInterval = 0.02f;
@@ -245,6 +266,9 @@ private:
 	float LastTransformSyncTime = -1000.0f;
 	float LastNetLogTime = 0.0f;
 	bool bMappingContextAdded = false;
+
+	// 待消化的被推位移（本地累积，Tick 恒速消耗；不复制——被推端本地应用后经常规位姿上报收敛）
+	FVector PendingPushOffset = FVector::ZeroVector;
 
 	float CurrentMoveInput = 0.0f;
 	float CurrentTurnInput = 0.0f;

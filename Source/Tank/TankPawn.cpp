@@ -331,12 +331,31 @@ void ATankPawn::Tick(float DeltaTime)
 		}
 	}
 
+	// 0.9 被推位移平滑消化：推挤 RPC 按 推动 方帧率到达，节奏差会造成跳帧；
+	// 累积进 PendingPushOffset 后按恒定速度消耗（sweep 撞墙即弃剩余量，推动方下帧的推挤会继续跟进）
+	if (!PendingPushOffset.IsNearlyZero())
+	{
+		const FVector Step = PendingPushOffset.GetClampedToMaxSize(PushConsumeSpeed * DeltaTime);
+		FHitResult PushHit;
+		SetActorLocation(GetActorLocation() + Step, true, &PushHit);
+		PendingPushOffset = PushHit.bBlockingHit ? FVector::ZeroVector : PendingPushOffset - Step;
+	}
+
 	// 1. WASD 前后行进
 	if (!FMath::IsNearlyZero(CurrentMoveInput))
 	{
 		const FVector MoveDelta = FVector(CurrentMoveInput * MoveSpeed * DeltaTime, 0.0f, 0.0f);
 		FHitResult Hit;
 		AddActorLocalOffset(MoveDelta, true, &Hit);
+
+		// M1.5 挤压推进：本机扫掠被对方坦克挡住 → 沿本机推进方向把对方顶开
+		if (Hit.bBlockingHit)
+		{
+			if (ATankPawn* HitTank = Cast<ATankPawn>(Hit.GetActor()))
+			{
+				TryPushTank(HitTank, GetActorRotation().RotateVector(MoveDelta) * PushStrength);
+			}
+		}
 
 		if (TrackMaterialInstance)
 		{
@@ -584,4 +603,65 @@ void ATankPawn::ServerSyncTransform_Implementation(const FVector_NetQuantize100&
 		UE_LOG(LogTank, Log, TEXT("[M1] Server recv %s @ %s"),
 			*GetName(), *GetActorLocation().ToCompactString());
 	}
+}
+
+// ==================== M1.5 挤压推进 ====================
+
+void ATankPawn::TryPushTank(ATankPawn* HitTank, const FVector& PushDelta)
+{
+	if (HasAuthority())
+	{
+		ExecuteTankPush(HitTank, PushDelta);
+	}
+	else
+	{
+		ServerPushTank(HitTank, PushDelta);
+	}
+}
+
+bool ATankPawn::ServerPushTank_Validate(ATankPawn* PushedTank, FVector_NetQuantize10 PushDelta)
+{
+	// 宽松校验：拒绝空引用与物理上不可能的单帧推挤量（500cm ≫ 600cm/s 速度在任何合法 dt 下都到不了）
+	const FVector Delta(PushDelta);
+	return IsValid(PushedTank) && !Delta.ContainsNaN() && Delta.Size() < 500.0f;
+}
+
+void ATankPawn::ServerPushTank_Implementation(ATankPawn* PushedTank, FVector_NetQuantize10 PushDelta)
+{
+	ExecuteTankPush(PushedTank, FVector(PushDelta));
+}
+
+void ATankPawn::ClientApplyPush_Implementation(FVector_NetQuantize10 PushDelta)
+{
+	// Client RPC 只投递给被推端的所有者连接；防御性跳过服务器本机执行路径
+	if (!HasAuthority())
+	{
+		ApplyPushDelta(FVector(PushDelta));
+	}
+}
+
+void ATankPawn::ExecuteTankPush(ATankPawn* PushedTank, const FVector& PushDelta)
+{
+	if (!PushedTank || PushedTank == this || PushDelta.IsNearlyZero())
+	{
+		return;
+	}
+	// 注意：Listen 服务器上所有复制 Pawn 的 HasAuthority() 都是 true，不能用 HasAuthority 区分归属！
+	// IsLocallyControlled 在服务器上仅主机自有坦克为 true
+	if (PushedTank->IsLocallyControlled())
+	{
+		// 被推坦克属于主机：主机即权威，直接应用
+		PushedTank->ApplyPushDelta(PushDelta);
+	}
+	else
+	{
+		// 被推坦克由客户端权威：通知其所有者本地应用，随其常规位姿上报自动收敛到服务器（无位置打架）
+		PushedTank->ClientApplyPush(PushDelta);
+	}
+}
+
+void ATankPawn::ApplyPushDelta(const FVector& PushDelta)
+{
+	// 不瞬移：累积进平滑消化队列（上限 300cm 防积压），Tick 按 PushConsumeSpeed 恒速消耗
+	PendingPushOffset = (PendingPushOffset + PushDelta).GetClampedToMaxSize(300.0f);
 }
