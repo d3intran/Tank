@@ -26,10 +26,13 @@ public:
 
 	virtual void Tick(float DeltaTime) override;
 	virtual void SetupPlayerInputComponent(class UInputComponent* PlayerInputComponent) override;
-
 protected:
 	virtual void PostRegisterAllComponents() override;
 	virtual void BeginPlay() override;
+	virtual void PossessedBy(AController* NewController) override;
+	virtual void UnPossessed() override;
+	virtual void OnRep_Controller() override;
+	void AddDefaultMappingContext();
 
 	// ==========================================
 	// Components
@@ -229,6 +232,19 @@ private:
 	void OrbitCamera(const FInputActionValue& Value);
 	void ElevateGun(const FInputActionValue& Value);
 	void Fire();
+
+	// M1 客户端权威移动同步：本机客户端 20Hz 上报位姿，服务器应用后经 bReplicateMovement 转发其他端。
+	// Unreliable：位置流，丢一包下一包就补上，不需要可靠重传
+	UFUNCTION(Server, Unreliable)
+	void ServerSyncTransform(const FVector_NetQuantize100& Location, const FRotator& NetRotation);
+
+	// 上报间隔（秒）。20ms=50Hz：PIE 单进程下接近每帧同步；真插值缓冲留 M4
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Net", meta = (AllowPrivateAccess = "true", ClampMin = "0.02", ClampMax = "0.5"))
+	float TransformSyncInterval = 0.02f;
+
+	float LastTransformSyncTime = -1000.0f;
+	float LastNetLogTime = 0.0f;
+	bool bMappingContextAdded = false;
 
 	float CurrentMoveInput = 0.0f;
 	float CurrentTurnInput = 0.0f;

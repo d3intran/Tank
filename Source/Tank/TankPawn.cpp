@@ -38,6 +38,11 @@ ATankPawn::ATankPawn()
 	CollisionBox->SetSimulatePhysics(false);
 	RootComponent = CollisionBox;
 
+	// 联机（M1 客户端权威移动）：Pawn 基类已 bReplicates=true；
+	// 移动复制让服务器收到的位姿转发给其他端。
+	// 本机位姿上报见 Tick 的 ServerSyncTransform——不开它，服务器永远停在出生点会把客户端拉回原地
+	SetReplicateMovement(true);
+
 	// 1b. 坦克血量组件（M0 挂载；M2 联机升级 Replicated）
 	TankHealth = CreateDefaultSubobject<UTankHealth>(TEXT("TankHealth"));
 
@@ -253,19 +258,78 @@ void ATankPawn::BeginPlay()
 
 	UE_LOG(LogTank, Log, TEXT("TankPawn initialized with Vehicle-Relative Camera and Direct Gun Elevation."));
 
-	// 挂载输入映射上下文（Enhanced Input 要求在 BeginPlay/拥有后添加）
-	if (const APlayerController* PC = Cast<APlayerController>(GetController()))
+	AddDefaultMappingContext();
+}
+
+void ATankPawn::PossessedBy(AController* NewController)
+{
+	Super::PossessedBy(NewController);
+	// 服务器生成坦克的顺序是 Spawn（触发 BeginPlay，此时 Controller 为空）→ Possess。
+	// 映射上下文若只在 BeginPlay 挂，主机（服务器本地玩家）永远挂不上、输入失灵
+	AddDefaultMappingContext();
+}
+
+void ATankPawn::UnPossessed()
+{
+	Super::UnPossessed();
+	// M1 联调：抓 PIE 多开下主机占有被清空的时机（t=世界秒）
+	UE_LOG(LogTank, Warning, TEXT("[Input] %s 被 UnPossessed！t=%.1f"), *GetName(), GetWorld() ? GetWorld()->GetTimeSeconds() : -1.0f);
+}
+
+void ATankPawn::OnRep_Controller()
+{
+	Super::OnRep_Controller();
+	// 客户端的 Possess 不会跨网调用，用 Controller 复制回调兜底
+	AddDefaultMappingContext();
+}
+
+void ATankPawn::AddDefaultMappingContext()
+{
+	if (bMappingContextAdded || !DefaultMappingContext)
 	{
-		if (UEnhancedInputLocalPlayerSubsystem* Subsystem = ULocalPlayer::GetSubsystem<UEnhancedInputLocalPlayerSubsystem>(PC->GetLocalPlayer()))
-		{
-			Subsystem->AddMappingContext(DefaultMappingContext, 0);
-		}
+		return;
 	}
+	const APlayerController* PC = Cast<APlayerController>(GetController());
+	if (!PC)
+	{
+		UE_LOG(LogTank, Warning, TEXT("[Input] %s 挂上下文失败：无 PC（Role=%d）"), *GetName(), (int32)GetLocalRole());
+		return;
+	}
+	UEnhancedInputLocalPlayerSubsystem* Subsystem = ULocalPlayer::GetSubsystem<UEnhancedInputLocalPlayerSubsystem>(PC->GetLocalPlayer());
+	if (!Subsystem)
+	{
+		UE_LOG(LogTank, Warning, TEXT("[Input] %s 挂上下文失败：无 LocalPlayer 子系统"), *GetName());
+		return;
+	}
+	Subsystem->AddMappingContext(DefaultMappingContext, 0);
+	bMappingContextAdded = true;
+	UE_LOG(LogTank, Log, TEXT("[Input] %s 上下文已挂载（Role=%d）"), *GetName(), (int32)GetLocalRole());
 }
 
 void ATankPawn::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
+
+	// M1 客户端权威移动同步：本机客户端模拟 → 20Hz 上报服务器 →
+	// 服务器 SetActorLocationAndRotation 后经 bReplicateMovement 转发其他端。
+	// 主机端（Authority）直接本地模拟，无需上报
+	if (IsLocallyControlled() && !HasAuthority())
+	{
+		const float Now = GetWorld()->GetTimeSeconds();
+		if (Now - LastTransformSyncTime >= TransformSyncInterval)
+		{
+			LastTransformSyncTime = Now;
+			ServerSyncTransform(GetActorLocation(), GetActorRotation());
+
+			// M1 联调日志（每 2s 一条，M2 移除）
+			if (Now - LastNetLogTime >= 2.0f)
+			{
+				LastNetLogTime = Now;
+				UE_LOG(LogTank, Log, TEXT("[M1] %s send @ %s Role=%d"),
+					*GetName(), *GetActorLocation().ToCompactString(), (int32)GetLocalRole());
+			}
+		}
+	}
 
 	// 1. WASD 前后行进
 	if (!FMath::IsNearlyZero(CurrentMoveInput))
@@ -416,6 +480,7 @@ void ATankPawn::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
 
 void ATankPawn::MoveForward()
 {
+	UE_LOG(LogTank, Log, TEXT("[Input] %s MoveForward 触发（Role=%d）"), *GetName(), (int32)GetLocalRole());
 	CurrentMoveInput = 1.0f;
 }
 
@@ -503,4 +568,20 @@ void ATankPawn::Fire()
 
 	UE_LOG(LogTank, Log, TEXT("[Tank] FIRE! MuzzleLoc=(%.1f, %.1f, %.1f), Reloading %.1fs"),
 		MuzzleLoc.X, MuzzleLoc.Y, MuzzleLoc.Z, FireCooldown);
+}
+
+void ATankPawn::ServerSyncTransform_Implementation(const FVector_NetQuantize100& Location, const FRotator& NetRotation)
+{
+	// 信任客户端位姿（M1 无反作弊，见计划书）。不走 sweep：客户端本地已做过碰撞解析，
+	// 服务器再 sweep 会因时序差拒绝合法移动；物理状态重置避免与瞬时大步距冲突
+	SetActorLocationAndRotation(FVector(Location), NetRotation, false, nullptr, ETeleportType::ResetPhysics);
+
+	// M1 联调日志（每 2s 一条，M2 移除）
+	const float Now = GetWorld()->GetTimeSeconds();
+	if (Now - LastNetLogTime >= 2.0f)
+	{
+		LastNetLogTime = Now;
+		UE_LOG(LogTank, Log, TEXT("[M1] Server recv %s @ %s"),
+			*GetName(), *GetActorLocation().ToCompactString());
+	}
 }
