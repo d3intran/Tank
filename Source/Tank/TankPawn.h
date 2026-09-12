@@ -53,11 +53,18 @@ protected:
 	 *  2) 输入组件/动作绑定/映射上下文 —— 只对「本机玩家的本机 Pawn」做。 */
 	void EnsureClientReady();
 
+	/** 1s 心跳：RunUnderOneProcess 下客户端坦克的 Tick 会在运行中再次丢失（M4c-3 实测：
+	 *  车悬在掩体棱上、World 时钟照走、车一动不动；W 投键触发复制后才自愈回来）。
+	 *  上面那些钩子都依赖「有复制/占有事件」，没有网络流量时补不到 → 用定时器兜底。 */
+	void RepairTickTimer();
+	FTimerHandle TickRepairTimerHandle;
+
 	/** 把 VehicleScale 作用到根碰撞盒（构造函数与 PostRegisterAllComponents 各调一次，幂等）。
 	 *  根组件一缩放，所有子组件等比缩放；摄像机臂长是否跟缩由 bScaleCameraWithVehicle 决定。 */
 	void ApplyVehicleScale();
 
-	/** 地形跟随：地面探测 → 贴地 + 按坡面倾斜 / 悬空自由落体。
+	/** 地形跟随：前/后 × 左/右四角地面采样 → 由地面高差反推 pitch/roll 并贴地；
+	 *  四点都够不到地（或落差超出窗口）则自由落体。
 	 *  **无坠落伤害**：落地只把垂直速度归零，绝不调用 TakeDamage（本工程也没有任何 FallDamage 逻辑）。 */
 	void UpdateGroundContact(float DeltaTime);
 
@@ -131,21 +138,39 @@ protected:
 	// 这一段补上：地面探测 → 贴地 + 按坡面倾斜 → 被可行走面挡住时把位移投影到该面（slide）→ 悬空则自由落体。
 	// 只在 IsLocallyControlled() 实例上跑（与炮塔伺服同一套思路：远端实例的位置由复制决定，跑了会和复制打架）。
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Terrain", meta = (ClampMin = "0.0", ClampMax = "60.0", Units = "deg"))
-	float MaxClimbSlopeDeg = 45.0f; // 可行走坡度上限；中央坡道 40°，留 5° 余量
+	float MaxClimbSlopeDeg = 45.0f; // 可行走坡度上限；六块掩体坡道 30°，留 15° 余量
+	// （坡道加宽/改平后不再需要 40° 挤走廊，见 Scripts/level/level_cover_ramps.py）
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Terrain", meta = (ClampMin = "0.0", ClampMax = "100.0", Units = "cm"))
-	float MaxStepUp = 15.0f; // 台阶容差。**必须远小于边界台阶的 100**，否则坦克能翻过边界
+	float MaxStepUp = 15.0f; // 台阶容差：贴地采样接受的最大上台量，同时也是采样时
+	// 「高出车角当前高度这么多 = 台面/台阶上沿」的排除阈值（贴上去会瞬移）。
+	// **必须远小于边界台阶的 100**，否则坦克能翻过边界
+
+	/** 采样点比车角低过这个值，就不算「脚下的地」（那是台缘外的地面）。
+	 *  下限的来历：30° 坡上水平姿态时，车尾探针的落差可达 2·180·tan30° ≈ 208cm，所以必须大于它；
+	 *  又必须小于掩体/边界落差的量级（240~293cm），才拦得住「车头悬在台缘外」的采样。
+	 *  原来是按 45° 推的 390（太松）：车头悬在掩体边缘外时把下面 458cm 的路面当成坡面，
+	 *  姿态被带到 -39°，随后车头转进掩体顶面 —— M4c-3 玩家截图那辆「插土车」的起点。 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Terrain", meta = (ClampMin = "0.0", ClampMax = "1000.0", Units = "cm"))
+	float MaxContactDrop = 220.0f;
+
+	/** 姿态侧倾上限。本作场地没有横坡：roll 只可能来自骑棱/压半边坡，
+	 *  真坦克的侧倾容忍也就 15° 上下 —— 夹住它，免得被边缘采样把车带翻。 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Terrain", meta = (ClampMin = "0.0", ClampMax = "60.0", Units = "deg"))
+	float MaxGroundRollDeg = 15.0f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Terrain", meta = (ClampMin = "0.0", ClampMax = "500.0", Units = "cm"))
-	float GroundSnapDownDistance = 140.0f; // 贴地下探距离。必须明显大于「下坡时每帧的下沉量」，
-	// 否则下坡会反复离地、看起来像自由落体（M4b 调参教训：60 太小）
+	float GroundSnapDownDistance = 140.0f; // 停止贴地、转入自由落体的下探门槛。必须明显大于
+	// 「下坡时每帧的下沉量」，否则下坡会反复离地、看起来像自由落体（M4b 调参教训：60 太小）。
+	// 注意：**真在坠落时不吃这个窗口**，只给「本帧落体步长 + 5」，落地才不会一帧瞬移（M4c G3）
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Terrain", meta = (Units = "cm/s^2"))
 	float GroundGravityZ = -980.0f;
 
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Terrain", meta = (ClampMin = "0.0", ClampMax = "30.0"))
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Terrain", meta = (ClampMin = "0.0", ClampMax = "40.0"))
 	float GroundAlignSpeed = 18.0f; // 车身随坡面倾斜的平滑速率。
-	// 必须够快：坡道全长只有 1s 左右就能冲完，收敛太慢等于没贴坡（M4b：6 → 18）
+	// 必须够快：坡道全长只有 1s 左右就能冲完，收敛太慢等于没贴坡（M4b：6 → 18）。
+	// M4c 起姿态目标由四角地面反推，收敛期间车头会短暂啃进坡面，调大可缩短这个过渡
 
 	// ==========================================
 	// 整车缩放（M4b：坦克缩到 1/2）
@@ -179,8 +204,10 @@ protected:
 	// ==========================================
 	// Turret & Gun Parameters (电驱伺服机械平滑追踪与双向稳定)
 	// ==========================================
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tank|Turret", meta = (ClampMin = "1.0", UIMin = "5.0", UIMax = "120.0", Units = "deg/s"))
-	float TurretRotateSpeed = 70.0f; // 炮塔回转角速度（2× 灵敏度，基准 35°/s）
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tank|Turret", meta = (ClampMin = "1.0", UIMin = "5.0", UIMax = "200.0", Units = "deg/s"))
+	float TurretRotateSpeed = 140.0f; // 炮塔回转角速度（鼠标横向量驱动视口偏航，炮塔伺服追赶它）
+	// M4c-3：70 → 140（玩家要「两倍、更跟手」）。原来 70 是"2× 灵敏度"的保守取值，
+	// 手感上炮塔总是慢半个身位；现在与鼠标偏航同速，甩炮塔不用等
 
 	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Category = "Tank|Turret")
 	float CurrentTurretYaw = 0.0f;
@@ -195,7 +222,12 @@ protected:
 	float PitchSpeed = 20.0f; // 垂直俯仰电驱平滑角速度 20°/s，消除抽搐
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tank|Gun", meta = (ClampMin = "-45.0", ClampMax = "0.0", UIMin = "-30.0", UIMax = "0.0"))
-	float MinPitch = -5.0f; // 最大俯角 -5°
+	float MinPitch = -14.0f; // 最大俯角。
+	// 原来是 -5°（照真实坦克前向俯角写的），但本作要在掩体顶打地面上的坦克：
+	// 车在 293 高的掩体顶上时炮轴心离地 ~380，-5° 只能打到 34m 外，近处全是死角。
+	// M4c-3 实测几何（PIE 探针）：炮轴心离地 87、炮管世界伸出 ~228、炮管越过车体前缘 ~105、
+	// 车体甲板高 ~60 → 不切进车体的极限 ≈ atan((87-60)/105) ≈ 14°，取 -14° 留一点余量。
+	// 现在的死角半径 ≈ 380/tan14° ≈ 15m（原来 34m）。再往下调请对着侧视图看炮管会不会切进车体。
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tank|Gun", meta = (ClampMin = "0.0", ClampMax = "85.0", UIMin = "0.0", UIMax = "45.0"))
 	float MaxPitch = 20.0f; // 最大仰角 20°
@@ -410,16 +442,16 @@ private:
 
 	bool bMappingContextAdded = false;
 
-	// Tick 自愈的一次性闸门。与 bClientReady 分开：Tick 修复对客户端世界里的每一辆坦克都要做
-	// （含远端他机——它们的炮塔朝向也靠 Tick 落地），输入修复只对本机自己的车做
-	bool bTickRepaired = false;
+	// 自愈闸门：Tick 修复每次心跳都查（会被运行中再次弄丢，M4c-3 实测），
+	// 输入修复用一次性闸门（必须在拿到本机 Controller 之后才能做）
+	bool bClientReady = false;
 
 	// 地形跟随状态（只在受控实例上有意义）
 	float VerticalVelocity = 0.0f;
-	bool bGrounded = true;
 
-	// 输入自愈的一次性闸门（必须在拿到本机 Controller 之后才能做）
-	bool bClientReady = false;
+	// 是否有地面支撑（VisibleInstanceOnly：PIE 里可直接在细节面板/探针脚本里读，排查"浮空/贴地"用）
+	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Category = "Tank|Terrain", meta = (AllowPrivateAccess = "true"))
+	bool bGrounded = true;
 
 	// 本机位移首次真正生效时打一条 Log（每个实例只打一次）——排查「客户端只能开炮不能移动」时
 	// 这一行能直接区分「输入没到」和「Tick 没跑」，不需要再开 Verbose 刷屏

@@ -27,6 +27,9 @@ namespace
 	constexpr float RoadWheelRollRadius = 35.0f;
 	constexpr float RoadWheelY = 144.0f;
 	constexpr float RoadWheelZ = 41.75f;
+
+	// 地形跟随的四角探针内缩量（cm）：贴到碰撞盒角点里面一点，避免角点正好压着别的物体边缘
+	constexpr float GroundProbeInset = 10.0f;
 }
 
 ATankPawn::ATankPawn()
@@ -316,7 +319,18 @@ void ATankPawn::PostNetReceive()
 	// 且仅在 InputComponent == nullptr 时才绑）。PIE 三开实测：客户端世界的坦克
 	// Tick 注册 0 / 启用 0、InputComponent 为空、动作未绑、IMC 未挂 —— 输入回调
 	// （不走 Tick）活着、Tick 侧（位移/炮塔/视口/轮子）是死的，表现即「只能开炮不能移动」。
-	// 幂等由 EnsureClientReady 内部的 bTickRepaired / bClientReady 两个闸门保证。
+	// 幂等由 EnsureClientReady 内部闸门保证（Tick 部分每次查，输入部分一次性）。
+	EnsureClientReady();
+
+	// 1s 心跳兜底：RunUnderOneProcess 下客户端坦克的 Tick 会在运行中再次丢失，
+	// 而上面那些钩子都依赖「有复制/占有事件」—— 没有网络流量时补不到
+	// （M4c-3 实测：车悬在掩体棱上、World 时钟照走、车一动不动，投一次键触发复制才自愈）。
+	GetWorldTimerManager().SetTimer(TickRepairTimerHandle, this, &ATankPawn::RepairTickTimer, 1.0f, true);
+}
+
+void ATankPawn::RepairTickTimer()
+{
+	// 内部只有「未注册才注册、未启用才启用」的开关判断，开销可忽略
 	EnsureClientReady();
 }
 
@@ -335,9 +349,9 @@ void ATankPawn::EnsureClientReady()
 	// 全都在 Tick 里落地。实测另一客户端看这辆车：net_turret_yaw 已复制到 102.1、
 	// current_turret_yaw 仍是 0 —— 复制值到了但 TurretPivot 不动，炮塔就是不转。
 	// 所以这一段不做归属判断，先把 Tick 修好。RegisterTickFunction 自带幂等闸门。
-	if (!bTickRepaired)
+	// **不加一次性闸门**：M4c-3 实测 Tick 会在运行中再次丢失（车悬在棱上一动不动、World 时钟照走），
+	// 而 RegisterAllActorTickFunctions / SetActorTickEnabled 的开关检查本身很便宜 —— 每次都查。
 	{
-		bTickRepaired = true;
 		const bool bWasRegistered = PrimaryActorTick.IsTickFunctionRegistered();
 		const bool bWasEnabled = IsActorTickEnabled();
 		if (!bWasRegistered)
@@ -780,40 +794,235 @@ void ATankPawn::UpdateGroundContact(float DeltaTime)
 		return;
 	}
 
-	const float HalfHeight = CollisionBox->GetScaledBoxExtent().Z;
+	const FVector Extent = CollisionBox->GetScaledBoxExtent();
+	const float HalfHeight = FMath::Max(1.0f, Extent.Z);
 	const float WalkableCos = FMath::Cos(FMath::DegreesToRadians(MaxClimbSlopeDeg));
+	const FVector Loc = GetActorLocation();
+	const FRotator CurrentRot = GetActorRotation();
 
-	// 地面探测：起点从盒底再抬高 10cm，避免起点嵌在地面里导致射线从内部穿过
-	// 通道用 ECC_Visibility：坦克的 Pawn profile 对 Visibility 是 Ignore，
-	// 所以不会「贴到别的坦克」上，只认地面 / 掩体 / 坡
-	const FVector ProbeStart = GetActorLocation() - FVector(0.0f, 0.0f, HalfHeight - 10.0f);
-	const FVector ProbeEnd = ProbeStart - FVector(0.0f, 0.0f, 10.0f + GroundSnapDownDistance);
+	// ---- 四角地面采样 ----
+	// 单点中心采样在坡上必然失明：车身水平爬 30° 坡时坡面在车心正下方已比盒底低
+	// 190·tan30° ≈ 110cm（40° 时 159cm），超出 140 窗口 → 探针打空 → 上坡全程 0°、车尾悬空、
+	// 下坡到坡底还会翻平拽一帧。改成前/后 × 左/右四点：
+	//   前后高差 → pitch，左右高差 → roll，四点均值 → 贴地高度；姿态与高度都由地面说了算。
+	// 探针水平位置只按 yaw 旋转：车体俯仰会让轴距在世界里的投影缩短，
+	// 但「车头下方是哪块地」必须按固定轴距算，否则坡上前后探针越凑越近、pitch 越算越平
+	const FRotationMatrix YawMat(FRotator(0.0f, CurrentRot.Yaw, 0.0f));
+	const float ProbeLong = FMath::Max(10.0f, Extent.X - GroundProbeInset);
+	const float ProbeLat = FMath::Max(10.0f, Extent.Y - GroundProbeInset);
+
+	// 起点高过任何姿态下的盒顶；终点深到能看见「车角悬空一个轴距」处的坡面 ——
+	// 车身水平搭在坡上时，车尾下方的坡面比车尾角点低 2·ProbeLong·tan(坡角)
+	const float ProbeUp = Extent.X + HalfHeight + 20.0f;
+	const float ProbeDown = 3.0f * Extent.X + HalfHeight + 20.0f;
 
 	FCollisionQueryParams Params(TEXT("TankGroundProbe"), /*bTraceComplex=*/false, this);
-	FHitResult Ground;
-	const bool bHasGround = GetWorld()->LineTraceSingleByChannel(Ground, ProbeStart, ProbeEnd, ECC_Visibility, Params);
+	Params.AddIgnoredActor(this);
 
-	if (bHasGround && Ground.ImpactNormal.Z >= WalkableCos)
+	// ---- 脱困保险（M4c-3）----
+	// 万一车还是嵌进了实体（姿态对齐 / 被推挤 / 出生点重叠），逐级抬起直到「不再阻塞」。
+	// 必须存在的原因：一旦埋进去，角点采样会因「地面在角点上方」被排除，
+	// 只剩「保持当前姿态」的单侧分支，靠自己永远出不来（M4c-3 实测埋深 160cm 自锁）。
+	auto DepenetrateIfStuck = [&]()
 	{
-		// ---- 贴地 ----
-		bGrounded = true;
-		VerticalVelocity = 0.0f;
-
-		const float CurrentBottom = GetActorLocation().Z - HalfHeight;
-		const float TargetBottom = Ground.ImpactPoint.Z;
-		if (!FMath::IsNearlyEqual(CurrentBottom, TargetBottom, 0.25f))
+		const FCollisionShape BoxShape = FCollisionShape::MakeBox(FVector(
+			FMath::Max(1.0f, Extent.X - 1.0f),
+			FMath::Max(1.0f, Extent.Y - 1.0f),
+			FMath::Max(1.0f, Extent.Z - 1.0f)));
+		const FVector Base = GetActorLocation();
+		const FQuat Rot = GetActorQuat();
+		constexpr float LiftStep = 24.0f;
+		constexpr int32 MaxSteps = 12;           // 单帧最多抬 288cm（埋得深就分几帧抬出来）
+		for (int32 Step = 0; Step <= MaxSteps; ++Step)
 		{
-			SetActorLocation(GetActorLocation() + FVector(0.0f, 0.0f, TargetBottom - CurrentBottom), /*bSweep=*/true);
+			const FVector Test = Base + FVector(0.0f, 0.0f, Step * LiftStep);
+			// ECC_Visibility：只认关卡几何（别的坦克对 Visibility 是 Ignore，互相挤压交给推挤链路）
+			if (!GetWorld()->OverlapBlockingTestByChannel(Test, Rot, ECC_Visibility, BoxShape, Params))
+			{
+				if (Step > 0)
+				{
+					// 目标点已确认无阻塞 → 直接摆放。不要 sweep：起点就在实体里，扫掠会被判 Time=0 原地不动
+					SetActorLocation(Test, /*bSweep=*/false);
+					VerticalVelocity = 0.0f;
+					UE_LOG(LogTank, Log, TEXT("[Terrain] %s 脱困：抬起 %.0fcm"), *GetName(), Step * LiftStep);
+				}
+				return;
+			}
+		}
+		// 抬满一帧仍阻塞（埋得比 288cm 还深）：先把这一帧能抬的抬满，下一帧接着抬 —— 否则原地不动、永远出不来
+		SetActorLocation(Base + FVector(0.0f, 0.0f, MaxSteps * LiftStep), /*bSweep=*/false);
+		VerticalVelocity = 0.0f;
+		UE_LOG(LogTank, Warning, TEXT("[Terrain] %s 脱困：埋得太深，本帧先抬 %.0fcm（下一帧继续）"),
+			*GetName(), MaxSteps * LiftStep);
+	};
+
+	// 单个采样点探针。三类命中不算地面：
+	//   1) 竖面（掩体立面 / 边界 / 坡的侧面）—— 法线不够「可行走」；
+	//   2) 高出该点当前高度 MaxStepUp 以上的台面 —— 那是台阶上沿/别的平台，贴上去就是一帧瞬移；
+	//   3) 比该点低 MaxContactDrop 以下的深处地面 —— 那是「台缘外的地面」，不是脚下这块地。
+	auto SampleCorner = [&](float AlongX, float AlongY, float& OutZ, float& OutFloat) -> bool
+	{
+		const FVector Offset = YawMat.TransformVector(FVector(AlongX, AlongY, 0.0f));
+		const FVector Start = Loc + Offset + FVector(0.0f, 0.0f, ProbeUp);
+		const FVector End = Loc + Offset - FVector(0.0f, 0.0f, ProbeDown);
+
+		FHitResult Hit;
+		if (!GetWorld()->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility, Params))
+		{
+			return false;
+		}
+		if (Hit.ImpactNormal.Z < WalkableCos)
+		{
+			return false;
+		}
+		const float CornerBottom = Loc.Z + CurrentRot.RotateVector(FVector(AlongX, AlongY, -HalfHeight)).Z;
+		if (Hit.ImpactPoint.Z > CornerBottom + MaxStepUp)
+		{
+			return false;
+		}
+		if (Hit.ImpactPoint.Z < CornerBottom - MaxContactDrop)
+		{
+			return false;
+		}
+		OutZ = Hit.ImpactPoint.Z;
+		OutFloat = CornerBottom - Hit.ImpactPoint.Z;   // 该点离脚下地面的高度（≈0 = 真正受力）
+		return true;
+	};
+
+	// 顺序：0=左前 1=右前 2=左后 3=右后 4=前中 5=后中 6=左中 7=右中。
+	// 四角 + 四边中点共 8 点（M4c-3「逐点接触」）：骑棱时边中点常是唯一真正压住地面的点，
+	// 「对角骑棱、四角全悬空」也不至于丢掉支撑；只在四角采样时，姿态会被棱外那块地的采样带歪。
+	const float SampleAlongX[8] = { 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 0.0f, 0.0f };
+	const float SampleAlongY[8] = { -1.0f, 1.0f, -1.0f, 1.0f, 0.0f, 0.0f, -1.0f, 1.0f };
+	float SampleZ[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+	float SampleFloatHeight[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+	bool bSampleOK[8] = { false, false, false, false, false, false, false, false };
+	for (int32 i = 0; i < 8; ++i)
+	{
+		bSampleOK[i] = SampleCorner(SampleAlongX[i] * ProbeLong, SampleAlongY[i] * ProbeLat,
+			SampleZ[i], SampleFloatHeight[i]);
+	}
+
+	// 组：前(0,1,4) 后(2,3,5) 左(0,2,6) 右(1,3,7)。
+	// **姿态只由「真正受力的接触点」决定**：组内先找离车底最近的采样（最小浮空高度 = 接触候选），
+	// 比它高出 InlierTol 以上的点不参与平均 —— 那是另一块面，不是这一组脚下的地。
+	// 骑棱 / 压半边坡时，正是这些「另一块面」的采样把姿态拉歪的（玩家截图那辆歪车的 roll 来源）。
+	auto GroupZ = [&](int32 IndexA, int32 IndexB, int32 IndexC, float& OutZ) -> bool
+	{
+		float MinFloat = TNumericLimits<float>::Max();
+		const int32 Idx[3] = { IndexA, IndexB, IndexC };
+		for (int32 k = 0; k < 3; ++k)
+		{
+			if (bSampleOK[Idx[k]])
+			{
+				MinFloat = FMath::Min(MinFloat, SampleFloatHeight[Idx[k]]);
+			}
+		}
+		if (MinFloat == TNumericLimits<float>::Max())
+		{
+			return false;
+		}
+		const float InlierTol = FMath::Max(MaxStepUp * 2.0f, 30.0f);
+		float Sum = 0.0f;
+		int32 Count = 0;
+		for (int32 k = 0; k < 3; ++k)
+		{
+			const int32 i = Idx[k];
+			if (bSampleOK[i] && SampleFloatHeight[i] <= MinFloat + InlierTol)
+			{
+				Sum += SampleZ[i];
+				++Count;
+			}
+		}
+		if (Count == 0)
+		{
+			return false;
+		}
+		OutZ = Sum / (float)Count;
+		return true;
+	};
+
+	float ZFront = 0.0f;
+	float ZRear = 0.0f;
+	const bool bHasFront = GroupZ(0, 1, 4, ZFront);
+	const bool bHasRear = GroupZ(2, 3, 5, ZRear);
+
+	float TargetPitch = CurrentRot.Pitch;
+	float TargetRoll = CurrentRot.Roll;
+	float CenterGroundZ = 0.0f;
+
+	if (bHasFront || bHasRear)
+	{
+		if (bHasFront && bHasRear)
+		{
+			// 前后探针间距是**水平**的 2·ProbeLong，地面高差 ΔZ → 坡度 tanθ = ΔZ / (2·ProbeLong)。
+			// 必须用 atan 而不是 asin：asin(ΔZ/2L) 会随间距变化（30° 坡会算成 asin(tan30°)=35.3°），
+			// 姿态一旦超过坡角，车就会以后角为支点翘头、前部整段悬空（M4c 实测坑）
+			TargetPitch = FMath::RadiansToDegrees(FMath::Atan2(ZFront - ZRear, 2.0f * ProbeLong));
+			CenterGroundZ = (ZFront + ZRear) * 0.5f;
+		}
+		else
+		{
+			// 只有一侧有地（另一侧整个悬在台/沟外）：把姿态**朝水平缓释**，而不是死抱当前角度 ——
+			// 骑棱悬空冻结时就是死抱 -39° 出不来；缓释几帧后车自己会趴回水平、靠在棱上。
+			const float RelaxSpeed = GroundAlignSpeed * 0.25f;
+			TargetPitch = FMath::FInterpTo(CurrentRot.Pitch, 0.0f, DeltaTime, RelaxSpeed);
+			TargetRoll = FMath::FInterpTo(CurrentRot.Roll, 0.0f, DeltaTime, RelaxSpeed);
+			const float SinCur = FMath::Sin(FMath::DegreesToRadians(TargetPitch));
+			CenterGroundZ = bHasFront ? ZFront - ProbeLong * SinCur : ZRear + ProbeLong * SinCur;
 		}
 
-		// ---- 按坡面法线倾斜车身：只改 pitch/roll，保留 yaw（转向仍绕车轴）----
-		// 不倾斜的话车会以水平姿态插进坡里，视觉与碰撞都难看
-		const FVector YawFwd = FRotationMatrix(FRotator(0.0f, GetActorRotation().Yaw, 0.0f)).GetUnitAxis(EAxis::X);
-		const FVector Right = FVector::CrossProduct(Ground.ImpactNormal, YawFwd).GetSafeNormal();
-		const FVector FwdOnPlane = FVector::CrossProduct(Right, Ground.ImpactNormal).GetSafeNormal();
-		const FRotator TargetRot = FRotationMatrix::MakeFromXZ(FwdOnPlane, Ground.ImpactNormal).Rotator();
-		SetActorRotation(FMath::RInterpTo(GetActorRotation(), TargetRot, DeltaTime, GroundAlignSpeed));
-		return;
+		float ZLeft = 0.0f;
+		float ZRight = 0.0f;
+		if (GroupZ(0, 2, 6, ZLeft) && GroupZ(1, 3, 7, ZRight))
+		{
+			// 左右同理（水平间距 2·ProbeLat）：右高为正 roll（UE 正 roll 抬右舷）
+			TargetRoll = FMath::RadiansToDegrees(FMath::Atan2(ZRight - ZLeft, 2.0f * ProbeLat));
+		}
+
+		const float PitchRad = FMath::DegreesToRadians(TargetPitch);
+		const float RollRad = FMath::DegreesToRadians(TargetRoll);
+		const float TiltCos = FMath::Max(0.05f, FMath::Cos(PitchRad) * FMath::Cos(RollRad));
+		// 车心到坡面的**竖直**距离 = 半高 / cos(倾角)：车心沿坡面法线离地半高，
+		// 法线本身斜了 θ，竖直投影就要除以 cosθ（写成 hh·cosθ 会矮 2·hh·sin²θ 的量，
+		// 30° 坡上正好差 18cm —— 车会一直"飘"在坡面上方，M4c 实测抓到的就是这个）
+		const float TargetActorZ = CenterGroundZ + HalfHeight / TiltCos;
+		const float DeltaZ = TargetActorZ - Loc.Z;
+
+		// 下探窗口：贴地跟随时给足 GroundSnapDownDistance（下坡每帧的下沉量要吃得下）；
+		// 真处于坠落中只给「本帧落体步长 + 5」—— 落地那一帧的位移就和前面几帧同量级，
+		// 不会出现「一帧贴地 131cm」的瞬移（M4c G3）
+		const float MaxDown = (VerticalVelocity < -50.0f)
+			? FMath::Max(20.0f, -VerticalVelocity * DeltaTime + 5.0f)
+			: GroundSnapDownDistance;
+
+		if (DeltaZ >= -MaxDown && DeltaZ <= MaxStepUp)
+		{
+			bGrounded = true;
+			VerticalVelocity = 0.0f;
+			if (!FMath::IsNearlyZero(DeltaZ, 0.25f))
+			{
+				// 用 sweep 贴地：即使被坡面挡住也只是「停在接触点」，不会穿模
+				SetActorLocation(Loc + FVector(0.0f, 0.0f, DeltaZ), /*bSweep=*/true);
+			}
+
+			// ---- 按地面姿态倾斜车身：只改 pitch/roll，保留 yaw（转向仍绕车轴）----
+			// 不倾斜的话车会以水平姿态插进坡里，视觉与碰撞都难看。
+			// **必须带扫掠**：裸的 SetActorRotation 会在骑边缘（一侧悬空）时把车角直接转进坡/掩体里
+			// （M4c-3 取证：埋深 160cm、pitch -51.8° 自锁）。UE5.8 的 AActor::SetActorRotation 没有
+			// bSweep 重载 → 用根组件的 MoveComponent（零位移 + 新旋转）来扫掠旋转。
+			// 角度夹：pitch 夹到最大爬坡角；roll 夹到 MaxGroundRollDeg（本作没有横坡，roll 只可能来自骑棱，
+			// 不夹住就会被边缘采样把车带翻 —— 玩家截图那辆歪车）
+			const FRotator TargetRot(
+				FMath::Clamp(TargetPitch, -MaxClimbSlopeDeg, MaxClimbSlopeDeg),
+				CurrentRot.Yaw,
+				FMath::Clamp(TargetRoll, -MaxGroundRollDeg, MaxGroundRollDeg));
+			CollisionBox->MoveComponent(FVector::ZeroVector,
+				FMath::RInterpTo(CurrentRot, TargetRot, DeltaTime, GroundAlignSpeed), /*bSweep=*/true);
+
+			DepenetrateIfStuck();
+			return;
+		}
 	}
 
 	// ---- 悬空：走出平台边缘 / 从坡顶开下去 → 自由落体 ----
@@ -823,12 +1032,31 @@ void ATankPawn::UpdateGroundContact(float DeltaTime)
 	VerticalVelocity = FMath::Max(VerticalVelocity + GroundGravityZ * DeltaTime, -6000.0f);
 
 	FHitResult FallHit;
-	SetActorLocation(GetActorLocation() + FVector(0.0f, 0.0f, VerticalVelocity * DeltaTime), /*bSweep=*/true, &FallHit);
+	SetActorLocation(Loc + FVector(0.0f, 0.0f, VerticalVelocity * DeltaTime), /*bSweep=*/true, &FallHit);
 	if (FallHit.bBlockingHit)
 	{
-		VerticalVelocity = 0.0f;
-		bGrounded = FallHit.ImpactNormal.Z >= WalkableCos;
+		if (FallHit.ImpactNormal.Z >= WalkableCos)
+		{
+			// 落到可行走面 → 真落地
+			VerticalVelocity = 0.0f;
+			bGrounded = true;
+		}
+		else
+		{
+			// 蹭到竖面/棱角（法线不可行走）不是支撑：沿接触面切向继续滑落。
+			// 否则会「骑在棱上悬空冻结」—— M4c-3 实测：车头搭在掩体边缘棱上、尾浮 223cm、姿态不动；
+			// 切向投影对竖面是整段落体（沿墙滑下），对棱角是「往外挪一点」，最终自己滑下去。
+			const FVector SlideStep = FVector::VectorPlaneProject(
+				FVector(0.0f, 0.0f, VerticalVelocity * DeltaTime), FallHit.ImpactNormal);
+			if (!SlideStep.IsNearlyZero())
+			{
+				// 沿切向**直接摆放**：此时车正贴着棱/墙（扫掠起点就已接触），带扫掠的位移会被判 Time=0 原地不动
+				SetActorLocation(GetActorLocation() + SlideStep, /*bSweep=*/false);
+			}
+		}
 	}
+
+	DepenetrateIfStuck();
 }
 
 void ATankPawn::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
