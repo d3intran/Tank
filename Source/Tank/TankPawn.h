@@ -132,11 +132,18 @@ protected:
 	float TurnSpeed = 60.0f;
 
 	// ==========================================
-	// 地形跟随（M4b：能爬上坡、也能摔下来；无坠落伤害）
+	// 地形跟随（M4b 起，M4c 三轮收口：八点接触采样 + 坠落/脱困安全网；无坠落伤害）
 	// ==========================================
-	// 原来位移只有水平扫掠，没有重力也不贴地 —— 于是任何坡都会像墙一样挡住坦克。
-	// 这一段补上：地面探测 → 贴地 + 按坡面倾斜 → 被可行走面挡住时把位移投影到该面（slide）→ 悬空则自由落体。
-	// 只在 IsLocallyControlled() 实例上跑（与炮塔伺服同一套思路：远端实例的位置由复制决定，跑了会和复制打架）。
+	// 位移走 AddActorLocalOffset(sweep)，撞坡后把剩余位移投影到坡面滑移；姿态靠 8 条向下射线
+	// （四角 + 四边中点）反推 pitch/roll；悬空则自由落体。只在 IsLocallyControlled() 实例上跑
+	// （与炮塔伺服同一套思路：远端实例的位置由复制决定，跑了会和复制打架）。
+	//
+	// ★★ 升级边界（Chaos 载具迁移）★★
+	// 本节全部内容（参数 + 状态 + cpp 里的 UpdateGroundContact / DepenetrateIfStuck）在
+	// 阶段 1（载具 Pawn）被 UChaosWheeledVehicleMovementComponent 取代、阶段 3 随联机改造整段删除。
+	// **因此这里不做重构**：只保持可读 + 边界清晰。删除清单见 docs/tank-vehicle-upgrade-plan.md。
+	// 保留（与载具实现无关，升级后继续用）：炮塔/火炮伺服、NetTurretYaw/NetGunPitch 复制、
+	// 负重轮视觉、履带 UV、开火/后坐力、头顶名牌锚点。
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Terrain", meta = (ClampMin = "0.0", ClampMax = "60.0", Units = "deg"))
 	float MaxClimbSlopeDeg = 45.0f; // 可行走坡度上限；六块掩体坡道 30°，留 15° 余量
 	// （坡道加宽/改平后不再需要 40° 挤走廊，见 Scripts/level/level_cover_ramps.py）
@@ -352,7 +359,15 @@ private:
 	void ElevateGun(const FInputActionValue& Value);
 	void Fire();
 
+	// ==========================================
 	// M1 客户端权威移动同步：本机客户端 50Hz 上报位姿，服务器应用后经移动复制转发其他端。
+	// ★★ 升级边界（Chaos 载具迁移 · 阶段 3）★★
+	// 下面这组（ServerSyncTransform + TransformSyncInterval/LastTransformSyncTime + Tick 里的上报段）
+	// 与 Chaos 载具的「服务器权威 + 客户端预测回滚」**互斥**，阶段 3 整段删除；
+	// 阶段 3 起位置的网络同步交给 UChaosWheeledVehicleMovementComponent。
+	// 注意：NetTurretYaw / NetGunPitch（本文件下半段）是**保留项** —— 炮塔/火炮朝向是玩家输入的本机状态，
+	// 载具组件不管，仍走这两个复制字段（届时可删掉 Tick 里「服务器本机写 NetTurretYaw」那段补丁）。
+	// ==========================================
 	// Unreliable：位置流，丢一包下一包就补上，不需要可靠重传
 	//
 	// TurretYaw/GunPitch 顺带一起上报：炮塔与火炮朝向同样是「本机权威、服务器不知道」的状态
@@ -447,6 +462,7 @@ private:
 	bool bClientReady = false;
 
 	// 地形跟随状态（只在受控实例上有意义）
+	// ★ 升级边界：与 UpdateGroundContact 一起删除；VerticalVelocity 在阶段 3 之后由载具组件自带
 	float VerticalVelocity = 0.0f;
 
 	// 是否有地面支撑（VisibleInstanceOnly：PIE 里可直接在细节面板/探针脚本里读，排查"浮空/贴地"用）

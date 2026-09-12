@@ -515,6 +515,7 @@ void ATankPawn::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
 
+	// ---- M1 位姿上报（★ 升级边界：阶段 3 删除，见 docs/tank-vehicle-upgrade-plan.md）----
 	// M1 客户端权威移动同步：本机客户端模拟 → 50Hz 上报服务器 →
 	// 服务器 SetActorLocationAndRotation 后经移动复制转发其他端。
 	// 主机端（Authority）直接本地模拟，无需上报
@@ -540,7 +541,8 @@ void ATankPawn::Tick(float DeltaTime)
 		PendingPushOffset = PushHit.bBlockingHit ? FVector::ZeroVector : PendingPushOffset - Step;
 	}
 
-	// 1. WASD 前后行进
+	// 1. WASD 前后行进（★ 升级边界：位移与滑面在阶段 1/3 交给 Chaos 载具，本段届时删除）
+	//    保留：M1.5 挤压推进（TryPushTank）与履带 UV —— 与载具实现无关，升级后按新组件重接
 	if (!FMath::IsNearlyZero(CurrentMoveInput))
 	{
 		const FVector MoveDelta = FVector(CurrentMoveInput * MoveSpeed * DeltaTime, 0.0f, 0.0f);
@@ -650,6 +652,15 @@ void ATankPawn::Tick(float DeltaTime)
 		// 复制值本身就是对端伺服后的结果，直接用（再插值只会引入额外滞后）
 		CurrentTurretYaw = NetTurretYaw;
 		CurrentPitch = NetGunPitch;
+	}
+
+	// 服务器本机的车：NetTurretYaw / NetGunPitch 只有客户端会经 ServerSyncTransform 写入，
+	// 主机自己那辆没人写 → 其他端永远看到炮塔朝 0、火炮朝 0（玩家「他人视角又看不到炮塔转」的真因）。
+	// 服务器权威 + 本机受控 → 把伺服结果直接写进复制字段，让它随属性复制发出去。
+	if (HasAuthority() && IsLocallyControlled())
+	{
+		NetTurretYaw = CurrentTurretYaw;
+		NetGunPitch = CurrentPitch;
 	}
 
 	if (TurretPivot)
@@ -787,6 +798,25 @@ float ATankPawn::GetBodyHalfHeight() const
 	return CollisionBox ? CollisionBox->GetScaledBoxExtent().Z : 118.0f * FMath::Max(VehicleScale, 0.01f);
 }
 
+// ============================================================================
+// 地形跟随（M4b 起，M4c 三轮收口）
+// ----------------------------------------------------------------------------
+// 算法一句话：采样 → 解目标 → 贴/转 → 安全网。
+//   1) 采样：以车心为原点，按 yaw 取水平偏移的 8 个点（四角 + 四边中点），各打一条竖直射线；
+//      过滤「竖面 / 高出车角 MaxStepUp 的台面 / 低于车角 MaxContactDrop 的台缘外地面」；
+//   2) 解目标：前(0,1,4)/后(2,3,5)/左(0,2,6)/右(1,3,7) 四组，组内先取最小浮空高度当接触候选，
+//      只有与它相差 ≤30cm 的采样参与平均（骑棱/压半边坡时另算一块面的点不算数）；
+//      前后高差 → pitch（atan2，水平间距 2·ProbeLong）、左右高差 → roll、四点均值 → 车底中心高度；
+//      车心目标 Z = 地面高 + 半高 / cos(倾角)；单侧有地时姿态朝水平缓释；
+//   3) 贴/转：Z 用 sweep 贴（坠落中把下探量限制在「本帧落体步长 + 5」防一帧瞬移），
+//      姿态用根组件 MoveComponent(零位移 + 新旋转, bSweep=true) 扫掠旋转（UE5.8 的 SetActorRotation 无 bSweep 重载）；
+//   4) 安全网：角度夹取（pitch ±MaxClimbSlopeDeg / roll ±MaxGroundRollDeg）、坠落沿切面滑落、
+//      脱困兜底 DepenetrateIfStuck（内缩 1cm 箱体测阻塞 → 逐级抬起）。
+//
+// ★★ 升级边界（Chaos 载具迁移 · 阶段 1 取代 / 阶段 3 删除）★★
+// 本函数与其状态（VerticalVelocity/bGrounded）在阶段 3 整段删除，故此处不做结构性重构。
+// 删除清单与迁移步骤见 docs/tank-vehicle-upgrade-plan.md。
+// ============================================================================
 void ATankPawn::UpdateGroundContact(float DeltaTime)
 {
 	if (!CollisionBox)
