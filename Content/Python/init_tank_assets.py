@@ -7,7 +7,7 @@ import os
 # 3. 构建 M_TrackStatic（轮盘静态材质，取履带贴图）
 # 4. 材质指派：履带=mat_60，负重轮/车体/炮塔/炮=mat_61
 # 运行：UE 编辑器 > Tools > Execute Python Script。
-# OBJ 由 Scripts/split_tank_mesh.py 从 FBX 源生成。
+# OBJ 由 Scripts/tools/split_tank_mesh.py 从 FBX 源生成。
 
 DEST = "/Game/tank/ztz-88a"
 TRACKS_TEX = f"{DEST}/ztz88a-tracks"

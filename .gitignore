@@ -38,3 +38,6 @@ Thumbs.db
 .vscode/
 .idea/
 __pycache__/
+
+# 旧版 agent 家目录（已并入 .workbuddy/，别再让它长回来）
+.workbuddy-ai/

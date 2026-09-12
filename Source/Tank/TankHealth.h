@@ -26,7 +26,11 @@ public:
 
 	FORCEINLINE float GetCurrentHealth() const { return CurrentHealth; }
 	FORCEINLINE float GetMaxHealth() const { return MaxHealth; }
-	FORCEINLINE bool IsDepleted() const { return bDepleted; }
+
+	// bDepleted 是服务器侧私有状态、不参与复制，直接返回它会让客户端永远认为坦克活着
+	// （BattleHUD 的头顶血条因此不会剔除已阵亡坦克）。CurrentHealth 是复制的，用它兜底判定，
+	// 两端结论一致；服务器侧两个条件等价，行为不变。
+	FORCEINLINE bool IsDepleted() const { return bDepleted || CurrentHealth <= 0.0f; }
 
 	UPROPERTY(BlueprintAssignable, Category = "Tank|Health")
 	FOnTankHealthChanged OnHealthChanged;

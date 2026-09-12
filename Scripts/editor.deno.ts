@@ -131,15 +131,39 @@ async function cmdOpen(flags: Flags): Promise<number> {
   if (await anyUnrealEditor()) console.log("注意：另一个 UE 项目编辑器在运行，将新开实例。");
   console.log("启动 Tank 编辑器…");
 
-  const child = new Deno.Command(EDITOR_EXE, {
-    args: [PROJECT],
-    detached: true,
-    stdin: "null",
-    stdout: "null",
-    stderr: "null",
-  }).spawn();
-  child.unref();
-  console.log(`已拉起进程（PID ${child.pid}）。`);
+  // 不能直接用 Deno.Command spawn：子进程会挂在调用方（自动化 shell）的 Windows Job Object 上，
+  // 调用方一退出编辑器就被连带回收。实测症状是「MCP 8000 已就绪、41s 后进程消失，
+  // Tank.log 停在模块加载中途且没有任何 shutdown 记录」——不是崩溃，是被杀。
+  // 走 WMI 的 Win32_Process.Create：发起进程是 WmiPrvSE.exe，落在我们的 job 之外。
+  const cmdLine = `"${EDITOR_EXE}" "${PROJECT}"`;
+  let pid = 0;
+  try {
+    const raw = await ps(
+      `$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create ` +
+      `-Arguments @{ CommandLine = '${cmdLine}' }; ` +
+      `Write-Output ("$($r.ReturnValue)|$($r.ProcessId)")`,
+    );
+    const [code, pidText] = raw.split("|");
+    if (code === "0") {
+      pid = Number(pidText) || 0;
+    } else {
+      console.error(`WMI 创建进程返回 ${code}，改用直接 spawn。`);
+    }
+  } catch (e) {
+    console.error(`WMI 启动失败（${(e as Error).message}），改用直接 spawn。`);
+  }
+  if (!pid) {
+    const child = new Deno.Command(EDITOR_EXE, {
+      args: [PROJECT],
+      detached: true,
+      stdin: "null",
+      stdout: "null",
+      stderr: "null",
+    }).spawn();
+    child.unref();
+    pid = child.pid;
+  }
+  console.log(`已拉起进程（PID ${pid}）。`);
 
   if (flags.nowait) return 0;
 

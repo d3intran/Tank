@@ -95,7 +95,7 @@ P1 现状是"啃墙根持续 DPS"（占位逻辑）。拍板闭环是"登顶瞬�
 3. **PileCenter 对齐**：FaceCenter=bbox 几何中点，未必是"正中央大门"（5 门分布）；需 PIE 实测门中心 X 与 PileCenter.X 对比
 4. 旧值残留嫌疑：代理 ClimbManager 的参数曾被多轮脚本改写，PIE 前建议探针核对实际生效值（probe_params.py 模式）
 
-**调查工具**：Scripts/probe_pie.py（PIE 内 Actor/状态探针，注意 get_editor_world 在 PIE 期间返回 None、get_game_world 在 PIE 结束后返回残留世界）、Scripts/probe_params.py、LogsToolset（有陈旧缓冲，不能只信日志，截图/探针交叉验证）
+**调查工具**：Scripts/probe/probe_pie.py（PIE 内 Actor/状态探针，注意 get_editor_world 在 PIE 期间返回 None、get_game_world 在 PIE 结束后返回残留世界）、Scripts/probe/probe_params.py、LogsToolset（有陈旧缓冲，不能只信日志，截图/探针交叉验证）
 
 ## 本轮教训（已入项目记忆 p2a-climb-pipeline.md）
 
