@@ -22,7 +22,7 @@ class UFont;
  *   左下角  本机血条 + 装填进度 + 重生保护提示
  *   右上角  常驻计分板（按击杀降序，本机高亮）
  *   屏幕中央 本机阵亡/重生提示、回合结束的胜利面板
- *   世界中  其他玩家坦克头顶血条（被建筑遮挡时不画）
+ *   世界中  其他玩家坦克头顶「玩家 ID + 血条」（被建筑遮挡时不画）
  */
 UCLASS()
 class TANK_API ABattleHUD : public AHUD
@@ -39,8 +39,14 @@ private:
 	/** 左下角本机状态：血条（分段变色+低血呼吸）、装填进度、重生保护提示 */
 	void DrawLocalStatus(ATankPawn* MyTank);
 
-	/** 其他玩家坦克头顶血条（含 80m 距离剔除 + Visibility 通道遮挡剔除，避免穿墙看到） */
+	/** 其他玩家坦克头顶「玩家 ID + 血条」（含 80m 距离剔除 + Visibility 通道遮挡剔除，避免穿墙看到） */
 	void DrawOverheadBars(ATankPawn* MyTank);
+
+	/** 头顶名牌：居中画在血条上方，带半透明底衬与描边（Canvas 直绘没有描边，亮背景会糊） */
+	void DrawOverheadName(const FString& PlayerName, float CenterX, float BarTopY);
+
+	/** 取坦克所属玩家的显示名（Controller→PlayerState，都是复制值，各端一致）；拿不到返回空串 */
+	static FString ResolvePlayerName(const ATankPawn* Tank);
 
 	/** 右上角常驻计分板 */
 	void DrawScoreboard();

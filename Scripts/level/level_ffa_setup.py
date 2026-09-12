@@ -36,7 +36,7 @@ out.append("Cube=%s  Material=%s" % (cube.get_name() if cube else None,
 def make_cover(label, cx, cy, sx, sy, sz, yaw=0.0):
     """在 (cx, cy) 生成一块 sx×sy×sz(cm) 的方形掩体，底面贴地。"""
     loc = unreal.Vector(cx, cy, COVER_Z_BASE + sz * 0.5)
-    rot = unreal.Rotator(0.0, yaw, 0.0)
+    rot = unreal.Rotator(pitch=0.0, yaw=yaw, roll=0.0)
     a = unreal.EditorLevelLibrary.spawn_actor_from_class(unreal.StaticMeshActor, loc, rot)
     if a is None:
         out.append("  !! 生成失败 %s" % label)
@@ -77,7 +77,7 @@ existing.sort(key=lambda a: a.get_name())
 out.append("  现有 PlayerStart %d 个，将复用前 %d 个、其余新建" % (len(existing), min(8, len(existing))))
 
 for i, (x, y, yaw) in enumerate(targets):
-    rot = unreal.Rotator(0.0, yaw, 0.0)
+    rot = unreal.Rotator(pitch=0.0, yaw=yaw, roll=0.0)
     if i < len(existing):
         a = existing[i]
         a.set_actor_location_and_rotation(unreal.Vector(x, y, SPAWN_Z), rot, False, False)

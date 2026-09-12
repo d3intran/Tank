@@ -70,7 +70,16 @@ D="E:/UE/Tank/Intermediate/Build/Win64/x64/UnrealEditor/Development/Tank"
 - `Scripts/pie/pie_*.py` 是 PIE 探针脚本（`out.append(...)` 约定，**禁止对 out 重新赋值**），跑前需 PIE 已在运行。
 - 关卡脚本（`Scripts/level/level_*.py`）执行后要显式保存，PIE 运行期间 `save_current_level()` 会失败，先停 PIE。
 
-### Python API 的两处坑（都实证过）
+### Python API 的坑（都实证过，按踩坑顺序）
+- **`unreal.Rotator` 按位置传参的顺序是 (roll, pitch, yaw)，不是 (pitch, yaw, roll)！**
+  `Rotator(0, 90, 0)` 实际是 pitch=90（车头朝天）。**一律用关键字**：
+  `unreal.Rotator(pitch=..., yaw=..., roll=...)`。
+  踩过的现场：坡道朝向立起来、出生点朝向全错（8/8 偏，想要的 yaw 进了 pitch）、瞬移后坦克 nose-up。
+  已修：`Scripts/probe/probe_rotator_order.py` 是判别探针；`level_spawn_facing_fix.py` 一次性修好了 8 个出生点。
+- **场上真正可行驶面是 road_hd / road_hd2（顶面 Z≈2.1）**，Floor（顶面 Z=-40）只是它下面的基底。
+  任何「贴地/坡道/出生高度」都要以 2.1 为基准，按 -40 算会露出几十厘米的坎。
+  取地面高度别猜，向下 trace 一发最稳（见 `level_cover_ramps.py` 的 ground_z_at）。
+- `SystemLibrary.delay()` 是 latent，桥脚本里不能用（会阻塞游戏线程）；分两次桥调用即可。
 - **`unreal.EditorAssetLibrary` 在本工程整个是坏的**：`load_asset` / `does_asset_exist` /
   `list_assets` 一律返回空（连 `/Game` 都报不存在），但同一次执行里 `unreal.load_asset("/Game/...")`
   正常、`AssetRegistryHelpers.get_assets_by_path` 也能列全。**取资产一律用 `unreal.load_asset`**。

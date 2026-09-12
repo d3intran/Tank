@@ -153,7 +153,11 @@ void ABattleHUD::DrawOverheadBars(ATankPawn* MyTank)
 		// "if behind the screen, clamp depth to the screen"）。
 		// 所以判据是 Z > 0（在相机前方），原来写的 Z == 0 恰好反了——
 		// 那只会在坦克跑到身后时才通过，正前方的坦克反而永远画不出头顶血条。
-		const FVector BarWorldLoc = TankLoc + FVector(0.0f, 0.0f, 240.0f);
+		//
+		// 锚点高度按车体实际高度推算（曾硬编码 240，那是 1:1 车高 236 时代的常数）：
+		// 坦克整车的 VehicleScale 一改，血条与名牌会自动跟着降下来
+		const float BarAnchorZ = Tank->GetSimpleCollisionHalfHeight() * 2.0f + 8.0f;
+		const FVector BarWorldLoc = TankLoc + FVector(0.0f, 0.0f, BarAnchorZ);
 		const FVector Projected = Canvas->Project(BarWorldLoc);
 		const bool bOnScreen = Projected.Z > 0.0f
 			&& Projected.X > -OverheadBarSize.X && Projected.X < Canvas->SizeX + OverheadBarSize.X
@@ -181,7 +185,48 @@ void ABattleHUD::DrawOverheadBars(ATankPawn* MyTank)
 		const float Ratio = FMath::Clamp(Health->GetCurrentHealth() / FMath::Max(Health->GetMaxHealth(), 1.0f), 0.0f, 1.0f);
 		DrawBar(Ratio, Projected.X - OverheadBarSize.X * 0.5f, Projected.Y, OverheadBarSize.X, OverheadBarSize.Y,
 			FLinearColor(0.85f, 0.12f, 0.12f, 0.9f));
+
+		// 名牌画在血条上方；名字与血条同生共死，所以沿用同一套投影与遮挡判据，不单独再测一次射
+		const FString PlayerName = ResolvePlayerName(Tank);
+		if (!PlayerName.IsEmpty())
+		{
+			DrawOverheadName(PlayerName, Projected.X, Projected.Y);
+		}
 	}
+}
+
+FString ABattleHUD::ResolvePlayerName(const ATankPawn* Tank)
+{
+	const AController* Ctrl = Tank ? Tank->GetController() : nullptr;
+	const APlayerState* PS = Ctrl ? Ctrl->PlayerState : nullptr;
+	return PS ? PS->GetPlayerName() : FString();
+}
+
+void ABattleHUD::DrawOverheadName(const FString& PlayerName, float CenterX, float BarTopY)
+{
+	UFont* Font = GEngine ? GEngine->GetSmallFont() : nullptr;
+	if (!Font)
+	{
+		return;
+	}
+
+	float TextW = 0.0f;
+	float TextH = 0.0f;
+	GetTextSize(PlayerName, TextW, TextH, Font, 1.0f);
+
+	const float TextX = CenterX - TextW * 0.5f;
+	const float TextY = BarTopY - TextH - 3.0f;
+
+	// 半透明底衬：Canvas 直绘没有描边，白字压在天空/浅色地面上会糊成一片
+	DrawRect(FLinearColor(0.0f, 0.0f, 0.0f, 0.45f), TextX - 4.0f, TextY - 1.0f, TextW + 8.0f, TextH + 2.0f);
+
+	// 四向各偏 1px 画深色，等效描边（比再加一个字体资产省事，灰盒阶段够用）
+	const FLinearColor Shadow(0.0f, 0.0f, 0.0f, 0.75f);
+	DrawText(PlayerName, Shadow, TextX - 1.0f, TextY, Font, 1.0f);
+	DrawText(PlayerName, Shadow, TextX + 1.0f, TextY, Font, 1.0f);
+	DrawText(PlayerName, Shadow, TextX, TextY - 1.0f, Font, 1.0f);
+	DrawText(PlayerName, Shadow, TextX, TextY + 1.0f, Font, 1.0f);
+	DrawText(PlayerName, FLinearColor(1.0f, 1.0f, 1.0f, 0.95f), TextX, TextY, Font, 1.0f);
 }
 
 void ABattleHUD::DrawScoreboard()

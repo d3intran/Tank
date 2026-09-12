@@ -53,6 +53,14 @@ protected:
 	 *  2) 输入组件/动作绑定/映射上下文 —— 只对「本机玩家的本机 Pawn」做。 */
 	void EnsureClientReady();
 
+	/** 把 VehicleScale 作用到根碰撞盒（构造函数与 PostRegisterAllComponents 各调一次，幂等）。
+	 *  根组件一缩放，所有子组件等比缩放；摄像机臂长是否跟缩由 bScaleCameraWithVehicle 决定。 */
+	void ApplyVehicleScale();
+
+	/** 地形跟随：地面探测 → 贴地 + 按坡面倾斜 / 悬空自由落体。
+	 *  **无坠落伤害**：落地只把垂直速度归零，绝不调用 TakeDamage（本工程也没有任何 FallDamage 逻辑）。 */
+	void UpdateGroundContact(float DeltaTime);
+
 	// ==========================================
 	// Components
 	// ==========================================
@@ -115,6 +123,49 @@ protected:
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tank|Movement", meta = (ClampMin = "0.0", UIMin = "0.0", Units = "deg/s"))
 	float TurnSpeed = 60.0f;
+
+	// ==========================================
+	// 地形跟随（M4b：能爬上坡、也能摔下来；无坠落伤害）
+	// ==========================================
+	// 原来位移只有水平扫掠，没有重力也不贴地 —— 于是任何坡都会像墙一样挡住坦克。
+	// 这一段补上：地面探测 → 贴地 + 按坡面倾斜 → 被可行走面挡住时把位移投影到该面（slide）→ 悬空则自由落体。
+	// 只在 IsLocallyControlled() 实例上跑（与炮塔伺服同一套思路：远端实例的位置由复制决定，跑了会和复制打架）。
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Terrain", meta = (ClampMin = "0.0", ClampMax = "60.0", Units = "deg"))
+	float MaxClimbSlopeDeg = 45.0f; // 可行走坡度上限；中央坡道 40°，留 5° 余量
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Terrain", meta = (ClampMin = "0.0", ClampMax = "100.0", Units = "cm"))
+	float MaxStepUp = 15.0f; // 台阶容差。**必须远小于边界台阶的 100**，否则坦克能翻过边界
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Terrain", meta = (ClampMin = "0.0", ClampMax = "500.0", Units = "cm"))
+	float GroundSnapDownDistance = 140.0f; // 贴地下探距离。必须明显大于「下坡时每帧的下沉量」，
+	// 否则下坡会反复离地、看起来像自由落体（M4b 调参教训：60 太小）
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Terrain", meta = (Units = "cm/s^2"))
+	float GroundGravityZ = -980.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Terrain", meta = (ClampMin = "0.0", ClampMax = "30.0"))
+	float GroundAlignSpeed = 18.0f; // 车身随坡面倾斜的平滑速率。
+	// 必须够快：坡道全长只有 1s 左右就能冲完，收敛太慢等于没贴坡（M4b：6 → 18）
+
+	// ==========================================
+	// 整车缩放（M4b：坦克缩到 1/2）
+	// ==========================================
+	// 只改这一个值：根碰撞盒的相对缩放一设，车体/履带/负重轮/炮塔/火炮/弹簧臂全部等比缩放。
+	// 注意**世界单位与网格局部长度混算的地方必须跟着乘**，否则不报错但会静默失真：
+	//   - 履带差速的半轮距（TrackSpan 是网格局部值）
+	//   - 负重轮滚动半径（同上，网格缩一半 → 同样线速度下轮子要转两倍快）
+	//   - 履带 UV 滚动速度（同上）
+	// HUD 的头顶名牌锚点已改为按碰撞盒推算，不在此列。
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Scale", meta = (ClampMin = "0.1", ClampMax = "2.0"))
+	float VehicleScale = 0.5f;
+
+	// 摄像机臂长是否跟着整车一起缩（保持第三人称观感比例）。
+	// 关掉 → 坦克在屏幕上显小、视野更远
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Scale")
+	bool bScaleCameraWithVehicle = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tank|Scale", meta = (ClampMin = "0.0", Units = "cm"))
+	float CameraArmLength = 950.0f; // 第三人称弹簧臂长度（未缩放时的基准值）
 
 	// ==========================================
 	// Wheel Parameters (负重轮差速旋转，布局由 Scripts/split_tank_mesh.py 生成)
@@ -245,6 +296,12 @@ public:
 	FORCEINLINE float GetCurrentTurretYaw() const { return CurrentTurretYaw; }
 	FORCEINLINE float GetCurrentPitch() const { return CurrentPitch; }
 	FORCEINLINE float GetCurrentMoveSpeed() const { return MoveSpeed; }
+
+	/** 车体中心到顶面的高度（**世界单位**，已含 VehicleScale）。
+	 *  HUD 的头顶血条/名牌锚点用它，整车缩放后名牌会自动跟着降下来，不必再硬编码。
+	 *  实现在 cpp —— 头文件里 UBoxComponent 只有前置声明。 */
+	float GetBodyHalfHeight() const;
+
 	FORCEINLINE float GetReloadProgress() const 
 	{ 
 		const float Elapsed = GetWorld() ? (GetWorld()->GetTimeSeconds() - LastFireTime) : FireCooldown;
@@ -356,6 +413,10 @@ private:
 	// Tick 自愈的一次性闸门。与 bClientReady 分开：Tick 修复对客户端世界里的每一辆坦克都要做
 	// （含远端他机——它们的炮塔朝向也靠 Tick 落地），输入修复只对本机自己的车做
 	bool bTickRepaired = false;
+
+	// 地形跟随状态（只在受控实例上有意义）
+	float VerticalVelocity = 0.0f;
+	bool bGrounded = true;
 
 	// 输入自愈的一次性闸门（必须在拿到本机 Controller 之后才能做）
 	bool bClientReady = false;

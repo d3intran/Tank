@@ -47,6 +47,9 @@ ATankPawn::ATankPawn()
 	// 本机位姿上报见 Tick 的 ServerSyncTransform——不开它，服务器永远停在出生点会把客户端拉回原地
 	SetReplicateMovement(true);
 
+	// M4b 整车缩放：只缩根组件，所有子组件等比跟缩（见 VehicleScale 的注释）
+	CollisionBox->SetRelativeScale3D(FVector(FMath::Max(VehicleScale, 0.01f)));
+
 	// 1b. 坦克血量组件（M0 挂载；M2 联机升级 Replicated）
 	TankHealth = CreateDefaultSubobject<UTankHealth>(TEXT("TankHealth"));
 
@@ -162,9 +165,10 @@ ATankPawn::ATankPawn()
 	}
 
 	// 8. 现代商业标杆视口弹簧臂（锁定舒适俯视角，彻底杜绝翻转眩晕，仅绕车体水平回旋）
+	// 臂长基准值在 CameraArmLength；是否跟整车一起缩放见 ApplyVehicleScale / bScaleCameraWithVehicle
 	SpringArm = CreateDefaultSubobject<USpringArmComponent>(TEXT("SpringArm"));
 	SpringArm->SetupAttachment(CollisionBox);
-	SpringArm->TargetArmLength = 950.0f;
+	SpringArm->TargetArmLength = CameraArmLength;
 	SpringArm->SetRelativeLocation(FVector(-50.0f, 0.0f, 220.0f));
 	SpringArm->SetRelativeRotation(FRotator(FixedCameraPitch, 0.0f, 0.0f));
 	SpringArm->bDoCollisionTest = true;
@@ -237,6 +241,10 @@ ATankPawn::ATankPawn()
 void ATankPawn::PostRegisterAllComponents()
 {
 	Super::PostRegisterAllComponents();
+
+	// M4b 整车缩放：构造函数里已经设过一次，这里再兜一次底（幂等），
+	// 覆盖「组件在编辑器里被改过缩放 / 蓝图子类改了 VehicleScale」的情况
+	ApplyVehicleScale();
 
 	// 核心架构自愈机制：强制保证编辑期与运行期拓扑及相对位姿一致性
 	if (TurretPivot && GunPivot)
@@ -544,9 +552,30 @@ void ATankPawn::Tick(float DeltaTime)
 			}
 		}
 
+		// M4b 爬坡：被「可行走」的面挡住 → 把剩余位移投影到该面继续走（slide）。
+		// 坡道 25° 的法线 Z≈0.91 ≥ cos30°≈0.87 → 会沿坡往上滑；
+		// 边界台阶是竖直面（法线 Z=0）→ 不满足条件 → 照样挡死，不会翻过边界
+		if (Hit.bBlockingHit)
+		{
+			const float WalkableCos = FMath::Cos(FMath::DegreesToRadians(MaxClimbSlopeDeg));
+			if (Hit.ImpactNormal.Z >= WalkableCos)
+			{
+				// 注意单位：MoveDelta 是局部空间，法线是世界空间 → 先转到世界再投影
+				const float ResidualScale = 1.0f - FMath::Clamp(Hit.Time, 0.0f, 1.0f);
+				const FVector WorldResidual = GetActorRotation().RotateVector(MoveDelta) * ResidualScale;
+				const FVector SlideDelta = FVector::VectorPlaneProject(WorldResidual, Hit.ImpactNormal);
+				if (!SlideDelta.IsNearlyZero())
+				{
+					SetActorLocation(GetActorLocation() + SlideDelta, /*bSweep=*/true);
+				}
+			}
+		}
+
 		if (TrackMaterialInstance)
 		{
-			TrackUVOffset += CurrentMoveInput * (MoveSpeed / FMath::Max(1.0f, TrackUVSpeedScale)) * DeltaTime;
+			// 履带纹理的滚动速度按「世界位移 / 纹理一格对应的世界长度」算：
+			// 整车缩了 VehicleScale，同样的世界速度下 UV 要滚得更快才对
+			TrackUVOffset += CurrentMoveInput * (MoveSpeed / (FMath::Max(1.0f, TrackUVSpeedScale) * FMath::Max(VehicleScale, 0.01f))) * DeltaTime;
 			TrackMaterialInstance->SetScalarParameterValue(TrackOffsetParamName, TrackUVOffset);
 		}
 	}
@@ -559,9 +588,17 @@ void ATankPawn::Tick(float DeltaTime)
 
 		if (TrackMaterialInstance && FMath::IsNearlyZero(CurrentMoveInput))
 		{
-			TrackUVOffset += CurrentTurnInput * (TurnSpeed / FMath::Max(1.0f, TrackUVSpeedScale * 0.1f)) * DeltaTime;
+			TrackUVOffset += CurrentTurnInput * (TurnSpeed / (FMath::Max(1.0f, TrackUVSpeedScale * 0.1f) * FMath::Max(VehicleScale, 0.01f))) * DeltaTime;
 			TrackMaterialInstance->SetScalarParameterValue(TrackOffsetParamName, TrackUVOffset);
 		}
+	}
+
+	// 2.5 地形跟随（M4b）：贴地 / 按坡面倾斜 / 悬空自由落体。
+	// 放在位移之后：这一帧先按上一帧的姿态走，然后探测新位置下的地面并修正。
+	// 只在受控实例上跑 —— 远端实例的位置由复制决定，跑了会和复制打架
+	if (IsLocallyControlled())
+	{
+		UpdateGroundContact(DeltaTime);
 	}
 
 	// 3. 视口跟随：继承车身偏航并叠加相对偏航角 CameraRelativeYaw，Pitch锁定在舒适俯角
@@ -630,7 +667,8 @@ void ATankPawn::Tick(float DeltaTime)
 	//   本机受控 → 直接用输入算，零延迟
 	//   其他（服务器上的他机 / 客户端的远端坦克）→ 输入恒为 0，必须从实际位移反推，
 	//   否则远端坦克会"车在滑行、轮子不转"
-	const float HalfSpan = FMath::Max(1.0f, TrackSpan) * 0.5f;
+	// TrackSpan 是网格局部长度，整车缩放后世界半轮距要乘 VehicleScale（M4b）
+	const float HalfSpan = FMath::Max(1.0f, TrackSpan) * 0.5f * FMath::Max(VehicleScale, 0.01f);
 
 	if (IsLocallyControlled())
 	{
@@ -702,13 +740,94 @@ void ATankPawn::UpdateWheelSpin(float DeltaTime, float TrackSpeedLeft, float Tra
 	for (int32 i = 0; i < RoadWheels.Num(); ++i)
 	{
 		const float SideSpeed = (i < 6) ? TrackSpeedRight : TrackSpeedLeft;
+		// RoadWheelRollRadius 是网格局部值；整车缩放后世界滚动半径变小，
+		// 同样履带线速度下轮子要转得更快（M4b）
+		const float WorldRollRadius = FMath::Max(1.0f, RoadWheelRollRadius * FMath::Max(VehicleScale, 0.01f));
 		RoadWheelAngles[i] = FMath::Fmod(
-			RoadWheelAngles[i] + SpinSign * FMath::RadiansToDegrees(SideSpeed / RoadWheelRollRadius) * DeltaTime,
+			RoadWheelAngles[i] + SpinSign * FMath::RadiansToDegrees(SideSpeed / WorldRollRadius) * DeltaTime,
 			360.0f);
 		if (RoadWheels[i])
 		{
 			RoadWheels[i]->SetRelativeRotation(FRotator(RoadWheelAngles[i], 0.0f, 0.0f));
 		}
+	}
+}
+
+void ATankPawn::ApplyVehicleScale()
+{
+	// 只缩根组件：车体/履带/负重轮/炮塔/火炮都挂在它下面，等比跟缩。
+	// 注意：SpringArm 的 TargetArmLength 是「世界距离」，不会随父级缩放，要单独处理
+	if (CollisionBox)
+	{
+		CollisionBox->SetRelativeScale3D(FVector(FMath::Max(VehicleScale, 0.01f)));
+	}
+	if (SpringArm)
+	{
+		SpringArm->TargetArmLength = CameraArmLength * (bScaleCameraWithVehicle ? FMath::Max(VehicleScale, 0.01f) : 1.0f);
+	}
+}
+
+float ATankPawn::GetBodyHalfHeight() const
+{
+	// 碰撞盒缩放后的半高（世界单位）——HUD 头顶名牌/血条的锚点高度来源
+	return CollisionBox ? CollisionBox->GetScaledBoxExtent().Z : 118.0f * FMath::Max(VehicleScale, 0.01f);
+}
+
+void ATankPawn::UpdateGroundContact(float DeltaTime)
+{
+	if (!CollisionBox)
+	{
+		return;
+	}
+
+	const float HalfHeight = CollisionBox->GetScaledBoxExtent().Z;
+	const float WalkableCos = FMath::Cos(FMath::DegreesToRadians(MaxClimbSlopeDeg));
+
+	// 地面探测：起点从盒底再抬高 10cm，避免起点嵌在地面里导致射线从内部穿过
+	// 通道用 ECC_Visibility：坦克的 Pawn profile 对 Visibility 是 Ignore，
+	// 所以不会「贴到别的坦克」上，只认地面 / 掩体 / 坡
+	const FVector ProbeStart = GetActorLocation() - FVector(0.0f, 0.0f, HalfHeight - 10.0f);
+	const FVector ProbeEnd = ProbeStart - FVector(0.0f, 0.0f, 10.0f + GroundSnapDownDistance);
+
+	FCollisionQueryParams Params(TEXT("TankGroundProbe"), /*bTraceComplex=*/false, this);
+	FHitResult Ground;
+	const bool bHasGround = GetWorld()->LineTraceSingleByChannel(Ground, ProbeStart, ProbeEnd, ECC_Visibility, Params);
+
+	if (bHasGround && Ground.ImpactNormal.Z >= WalkableCos)
+	{
+		// ---- 贴地 ----
+		bGrounded = true;
+		VerticalVelocity = 0.0f;
+
+		const float CurrentBottom = GetActorLocation().Z - HalfHeight;
+		const float TargetBottom = Ground.ImpactPoint.Z;
+		if (!FMath::IsNearlyEqual(CurrentBottom, TargetBottom, 0.25f))
+		{
+			SetActorLocation(GetActorLocation() + FVector(0.0f, 0.0f, TargetBottom - CurrentBottom), /*bSweep=*/true);
+		}
+
+		// ---- 按坡面法线倾斜车身：只改 pitch/roll，保留 yaw（转向仍绕车轴）----
+		// 不倾斜的话车会以水平姿态插进坡里，视觉与碰撞都难看
+		const FVector YawFwd = FRotationMatrix(FRotator(0.0f, GetActorRotation().Yaw, 0.0f)).GetUnitAxis(EAxis::X);
+		const FVector Right = FVector::CrossProduct(Ground.ImpactNormal, YawFwd).GetSafeNormal();
+		const FVector FwdOnPlane = FVector::CrossProduct(Right, Ground.ImpactNormal).GetSafeNormal();
+		const FRotator TargetRot = FRotationMatrix::MakeFromXZ(FwdOnPlane, Ground.ImpactNormal).Rotator();
+		SetActorRotation(FMath::RInterpTo(GetActorRotation(), TargetRot, DeltaTime, GroundAlignSpeed));
+		return;
+	}
+
+	// ---- 悬空：走出平台边缘 / 从坡顶开下去 → 自由落体 ----
+	// 注意：**刻意不做坠落伤害**。本工程没有任何 FallDamage/Landed 逻辑，
+	// TakeDamage 只由炮弹命中调用 —— 落地这里只清速度，绝不要在这里加伤害
+	bGrounded = false;
+	VerticalVelocity = FMath::Max(VerticalVelocity + GroundGravityZ * DeltaTime, -6000.0f);
+
+	FHitResult FallHit;
+	SetActorLocation(GetActorLocation() + FVector(0.0f, 0.0f, VerticalVelocity * DeltaTime), /*bSweep=*/true, &FallHit);
+	if (FallHit.bBlockingHit)
+	{
+		VerticalVelocity = 0.0f;
+		bGrounded = FallHit.ImpactNormal.Z >= WalkableCos;
 	}
 }
 
