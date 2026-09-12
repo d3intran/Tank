@@ -1,7 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "GameFramework/GameMode.h"
+#include "GameFramework/GameModeBase.h"
 #include "BattleGameMode.generated.h"
 
 class ATankPlayerState;
@@ -14,7 +14,7 @@ class ATankPlayerState;
  * 需要让客户端看到的数据（计分板、胜负面板）分别放 PlayerState / GameState 复制过去。
  */
 UCLASS(config = Game)
-class TANK_API ABattleGameMode : public AGameMode
+class TANK_API ABattleGameMode : public AGameModeBase
 {
 	GENERATED_BODY()
 
@@ -24,6 +24,11 @@ public:
 	virtual void PostLogin(APlayerController* NewPlayer) override;
 	virtual void Logout(AController* Exiting) override;
 	virtual AActor* ChoosePlayerStart_Implementation(AController* Player) override;
+
+	/** 每个玩家用哪种坦克：Config 里的 bUseChaosVehicle 决定。
+	 *  **必须用这个钩子而不是在 BeginPlay 里改 DefaultPawnClass** —— 实测单人 PIE 下
+	 *  PostLogin（首台车生成）发生在 BeginPlay **之前**，那时改已经晚了（拿到的是旧 Pawn）。 */
+	virtual UClass* GetDefaultPawnClassForController_Implementation(AController* InController) override;
 
 	// 必须覆盖为 false，否则 FFA 选点在重生时根本不会执行（见 .cpp 注释）
 	virtual bool ShouldSpawnAtStartSpot(AController* Player) override;
@@ -61,6 +66,13 @@ protected:
 	/** 回合结束后多久自动重开（秒），同样可在 ini 里调 */
 	UPROPERTY(Config, EditDefaultsOnly, BlueprintReadOnly, Category = "Tank|Rules", meta = (ClampMin = "0.0", Units = "s"))
 	float RoundRestartDelay = 5.0f;
+
+	/** 用 Chaos 载具坦克（ATankVehicle）还是手写地形跟随的 ATankPawn。
+	 *  在 Config/DefaultGame.ini 的 [/Script/Tank.BattleGameMode] 段改：
+	 *      bUseChaosVehicle=True
+	 *  Chaos 载具的联机移动同步与炮塔同步已全面就绪并通过实机三开对战验证。 */
+	UPROPERTY(Config, EditDefaultsOnly, BlueprintReadOnly, Category = "Tank|Vehicle")
+	bool bUseChaosVehicle = true;
 
 	/** 本局是否已分出胜负（防止同帧多人达标时重复结算） */
 	bool bMatchOver = false;

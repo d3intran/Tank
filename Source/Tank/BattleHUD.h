@@ -37,16 +37,22 @@ private:
 	void DrawBar(float Ratio, float X, float Y, float W, float H, FLinearColor FillColor);
 
 	/** 左下角本机状态：血条（分段变色+低血呼吸）、装填进度、重生保护提示 */
-	void DrawLocalStatus(ATankPawn* MyTank);
+	void DrawLocalStatus(APawn* MyTank);
+
+	/** 2D 双环矢量准心（屏幕中心视线基准 + 主炮物理落点动态追赶圆环 + 敌方锁定提示） */
+	void DrawAimReticle(APawn* MyTank);
+
+	/** 矢量圆环绘制助手（Canvas 直绘无贴图消耗） */
+	void DrawCircle2D(float CenterX, float CenterY, float Radius, int32 Segments, FLinearColor Color, float Thickness = 1.5f);
 
 	/** 其他玩家坦克头顶「玩家 ID + 血条」（含 80m 距离剔除 + Visibility 通道遮挡剔除，避免穿墙看到） */
-	void DrawOverheadBars(ATankPawn* MyTank);
+	void DrawOverheadBars(APawn* MyTank);
 
 	/** 头顶名牌：居中画在血条上方，带半透明底衬与描边（Canvas 直绘没有描边，亮背景会糊） */
 	void DrawOverheadName(const FString& PlayerName, float CenterX, float BarTopY);
 
 	/** 取坦克所属玩家的显示名（Controller→PlayerState，都是复制值，各端一致）；拿不到返回空串 */
-	static FString ResolvePlayerName(const ATankPawn* Tank);
+	static FString ResolvePlayerName(const APawn* Tank);
 
 	/** 右上角常驻计分板 */
 	void DrawScoreboard();
@@ -81,4 +87,12 @@ private:
 
 	UPROPERTY(EditDefaultsOnly, Category = "HUD")
 	float ScoreboardMargin = 30.0f;
+
+	// 准星基准半径（像素）
+	UPROPERTY(EditDefaultsOnly, Category = "HUD|Aim", meta = (ClampMin = "4.0", ClampMax = "64.0"))
+	float AimReticleBaseRadius = 12.0f;
+
+	// 准星收敛距离阈值（像素内视为转到位）
+	UPROPERTY(EditDefaultsOnly, Category = "HUD|Aim", meta = (ClampMin = "1.0", ClampMax = "100.0"))
+	float AimConvergenceThreshold = 14.0f;
 };

@@ -849,41 +849,80 @@ void ATankPawn::UpdateGroundContact(float DeltaTime)
 	FCollisionQueryParams Params(TEXT("TankGroundProbe"), /*bTraceComplex=*/false, this);
 	Params.AddIgnoredActor(this);
 
-	// ---- 脱困保险（M4c-3）----
-	// 万一车还是嵌进了实体（姿态对齐 / 被推挤 / 出生点重叠），逐级抬起直到「不再阻塞」。
-	// 必须存在的原因：一旦埋进去，角点采样会因「地面在角点上方」被排除，
+	// ---- 脱困保险（M4c-3；M4d 改「先水平推出，再逐帧上抬」）----
+	// 必须存在的原因：一旦埋进实体，角点采样会因「地面在角点上方」被排除，
 	// 只剩「保持当前姿态」的单侧分支，靠自己永远出不来（M4c-3 实测埋深 160cm 自锁）。
+	//
+	// 为什么不再「一步抬到不阻塞」：玩家实测 —— 顶着障碍物按住 W 再点 A/D，车会**瞬移到障碍物顶上**
+	// （侧面被挤进去几厘米，方块体一直往上测，第一次不阻塞的位置就在障碍物顶面之上）。
+	// 现在改成两级：
+	//   1) 先沿水平四个方向 8/16/24cm 找最近空位 → 贴墙/贴台阶被挤进去的深度本来就只有几厘米，
+	//      推回去即可，玩家看到的是"被墙挡了一下"；
+	//   2) 水平全堵才上抬，且**每帧只抬一步 24cm**，深埋时是"慢慢顶出来"而不是一帧闪现。
 	auto DepenetrateIfStuck = [&]()
 	{
-		const FCollisionShape BoxShape = FCollisionShape::MakeBox(FVector(
+		const FVector Shrink(6.0f, 6.0f, 6.0f);   // 判"真嵌进去"而不是"贴着"：内缩 6cm 再测
+		const FCollisionShape StuckShape = FCollisionShape::MakeBox(FVector(
+			FMath::Max(1.0f, Extent.X - Shrink.X),
+			FMath::Max(1.0f, Extent.Y - Shrink.Y),
+			FMath::Max(1.0f, Extent.Z - Shrink.Z)));
+		const FCollisionShape MoveShape = FCollisionShape::MakeBox(FVector(
 			FMath::Max(1.0f, Extent.X - 1.0f),
 			FMath::Max(1.0f, Extent.Y - 1.0f),
 			FMath::Max(1.0f, Extent.Z - 1.0f)));
 		const FVector Base = GetActorLocation();
 		const FQuat Rot = GetActorQuat();
-		constexpr float LiftStep = 24.0f;
-		constexpr int32 MaxSteps = 12;           // 单帧最多抬 288cm（埋得深就分几帧抬出来）
-		for (int32 Step = 0; Step <= MaxSteps; ++Step)
+		// ECC_Visibility：只认关卡几何（别的坦克对 Visibility 是 Ignore，互相挤压交给推挤链路）
+		auto Blocked = [&](const FVector& At, const FCollisionShape& Shape)
 		{
-			const FVector Test = Base + FVector(0.0f, 0.0f, Step * LiftStep);
-			// ECC_Visibility：只认关卡几何（别的坦克对 Visibility 是 Ignore，互相挤压交给推挤链路）
-			if (!GetWorld()->OverlapBlockingTestByChannel(Test, Rot, ECC_Visibility, BoxShape, Params))
+			return GetWorld()->OverlapBlockingTestByChannel(At, Rot, ECC_Visibility, Shape, Params);
+		};
+
+		// 内缩 6cm 还阻塞才算「真嵌进去」——贴着墙只是接触，不折腾
+		if (!Blocked(Base, StuckShape))
+		{
+			return;
+		}
+
+		constexpr float NudgeStep = 8.0f;
+		constexpr int32 NudgeRings = 3;
+		const FVector LocalDirs[] =
+		{
+			FVector(1.0f, 0.0f, 0.0f), FVector(-1.0f, 0.0f, 0.0f),
+			FVector(0.0f, 1.0f, 0.0f), FVector(0.0f, -1.0f, 0.0f)
+		};
+		for (int32 Ring = 1; Ring <= NudgeRings; ++Ring)
+		{
+			for (const FVector& Dir : LocalDirs)
 			{
-				if (Step > 0)
+				const FVector Offset = Rot.RotateVector(Dir) * (Ring * NudgeStep);
+				const FVector Test = Base + FVector(Offset.X, Offset.Y, 0.0f);
+				if (!Blocked(Test, MoveShape))
 				{
-					// 目标点已确认无阻塞 → 直接摆放。不要 sweep：起点就在实体里，扫掠会被判 Time=0 原地不动
+					// 已确认无阻塞 → 直接摆放。不要 sweep：起点就在实体里，扫掠会被判 Time=0 原地不动
 					SetActorLocation(Test, /*bSweep=*/false);
 					VerticalVelocity = 0.0f;
-					UE_LOG(LogTank, Log, TEXT("[Terrain] %s 脱困：抬起 %.0fcm"), *GetName(), Step * LiftStep);
+					UE_LOG(LogTank, Log, TEXT("[Terrain] %s 脱困：水平推出 %.0fcm（避免瞬移到障碍物顶上）"),
+						*GetName(), Ring * NudgeStep);
+					return;
 				}
-				return;
 			}
 		}
-		// 抬满一帧仍阻塞（埋得比 288cm 还深）：先把这一帧能抬的抬满，下一帧接着抬 —— 否则原地不动、永远出不来
-		SetActorLocation(Base + FVector(0.0f, 0.0f, MaxSteps * LiftStep), /*bSweep=*/false);
-		VerticalVelocity = 0.0f;
-		UE_LOG(LogTank, Warning, TEXT("[Terrain] %s 脱困：埋得太深，本帧先抬 %.0fcm（下一帧继续）"),
-			*GetName(), MaxSteps * LiftStep);
+
+		// 水平四周全被堵（典型是被埋进地板/别人的车里）→ 上抬，但每帧只抬一步
+		constexpr float LiftStep = 24.0f;
+		const FVector Test = Base + FVector(0.0f, 0.0f, LiftStep);
+		if (!Blocked(Test, MoveShape))
+		{
+			SetActorLocation(Test, /*bSweep=*/false);
+			VerticalVelocity = 0.0f;
+			UE_LOG(LogTank, Log, TEXT("[Terrain] %s 脱困：抬起 %.0fcm"), *GetName(), LiftStep);
+		}
+		else
+		{
+			// 本帧抬不动（上方也被堵）→ 留给下一帧；不要累积成一次性大位移
+			UE_LOG(LogTank, Verbose, TEXT("[Terrain] %s 脱困：水平与上方均阻塞，本帧不动"), *GetName());
+		}
 	};
 
 	// 单个采样点探针。三类命中不算地面：

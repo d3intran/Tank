@@ -1,6 +1,7 @@
 #include "BattleGameMode.h"
 #include "Tank.h"
 #include "TankPawn.h"
+#include "TankVehicle.h"
 #include "BattleHUD.h"
 #include "TankPlayerState.h"
 #include "TankGameState.h"
@@ -27,6 +28,8 @@ ABattleGameMode::ABattleGameMode()
 void ABattleGameMode::BeginPlay()
 {
 	Super::BeginPlay();
+
+	UE_LOG(LogTank, Log, TEXT("[Battle] 本局载具：%s"), bUseChaosVehicle ? TEXT("Chaos 载具 ATankVehicle") : TEXT("手写地形跟随 ATankPawn"));
 
 	// 把「先到多少杀」同步给客户端 HUD
 	if (ATankGameState* GS = GetGameState<ATankGameState>())
@@ -131,12 +134,16 @@ void ABattleGameMode::ResetRound()
 
 	// 3. 全体回炉：销毁现有坦克，让占有巡检在 2s 内按「离存活坦克最远」重新补发。
 	//    复用 M2 已端到端验证过的重生链路，不另写一套传送逻辑。
-	TArray<ATankPawn*> Tanks;
-	for (TActorIterator<ATankPawn> It(GetWorld()); It; ++It)
+	TArray<APawn*> Tanks;
+	for (TActorIterator<APawn> It(GetWorld()); It; ++It)
 	{
-		Tanks.Add(*It);
+		APawn* P = *It;
+		if (P && (P->IsA<ATankPawn>() || P->IsA<ATankVehicle>()))
+		{
+			Tanks.Add(P);
+		}
 	}
-	for (ATankPawn* Tank : Tanks)
+	for (APawn* Tank : Tanks)
 	{
 		if (IsValid(Tank))
 		{
@@ -170,6 +177,13 @@ void ABattleGameMode::EnsureAllPlayersHavePawns()
 			RestartPlayer(PC);
 		}
 	}
+}
+
+UClass* ABattleGameMode::GetDefaultPawnClassForController_Implementation(AController* InController)
+{
+	// 载具选型开关（Config/DefaultGame.ini 的 [/Script/Tank.BattleGameMode] 段）：
+	// true = Chaos 载具 ATankVehicle，false = 手写地形跟随 ATankPawn。
+	return bUseChaosVehicle ? ATankVehicle::StaticClass() : ATankPawn::StaticClass();
 }
 
 APawn* ABattleGameMode::SpawnDefaultPawnFor_Implementation(AController* NewPlayer, AActor* StartSpot)
@@ -226,10 +240,11 @@ AActor* ABattleGameMode::ChoosePlayerStart_Implementation(AController* Player)
 	}
 
 	TArray<FVector> TankLocs;
-	for (TActorIterator<ATankPawn> It(GetWorld()); It; ++It)
+	for (TActorIterator<APawn> It(GetWorld()); It; ++It)
 	{
-		ATankPawn* Tank = *It;
-		if (Tank && Tank->GetController() && Tank->GetController() != Player)
+		APawn* Tank = *It;
+		if (Tank && Tank->GetController() && Tank->GetController() != Player &&
+			(Tank->IsA<ATankPawn>() || Tank->IsA<ATankVehicle>()))
 		{
 			TankLocs.Add(Tank->GetActorLocation());
 		}

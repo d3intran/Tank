@@ -8,7 +8,8 @@ public class Tank : ModuleRules
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 	
-		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "EnhancedInput" });
+		// ChaosVehicles：UChaosWheeledVehicleMovementComponent（载具升级阶段 1 起）
+		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "EnhancedInput", "ChaosVehicles", "PhysicsCore" });
 
 		PrivateDependencyModuleNames.AddRange(new string[] {  });
 

@@ -1,6 +1,7 @@
 #include "BattleHUD.h"
 #include "Tank.h"
 #include "TankPawn.h"
+#include "TankVehicle.h"
 #include "TankHealth.h"
 #include "TankPlayerState.h"
 #include "TankGameState.h"
@@ -28,15 +29,16 @@ void ABattleHUD::DrawHUD()
 	}
 
 	// 本机坦克：PC->GetPawn 在重生瞬间为空，正好用来区分「活着」和「等待重生」
-	ATankPawn* MyTank = nullptr;
+	APawn* MyTank = nullptr;
 	if (APlayerController* PC = GetOwningPlayerController())
 	{
-		MyTank = Cast<ATankPawn>(PC->GetPawn());
+		MyTank = PC->GetPawn();
 	}
 
 	if (MyTank)
 	{
 		DrawLocalStatus(MyTank);
+		DrawAimReticle(MyTank);
 	}
 	else
 	{
@@ -59,8 +61,13 @@ void ABattleHUD::DrawBar(float Ratio, float X, float Y, float W, float H, FLinea
 	}
 }
 
-void ABattleHUD::DrawLocalStatus(ATankPawn* MyTank)
+void ABattleHUD::DrawLocalStatus(APawn* MyTank)
 {
+	if (!MyTank)
+	{
+		return;
+	}
+
 	UTankHealth* Health = MyTank->FindComponentByClass<UTankHealth>();
 	if (!Health)
 	{
@@ -94,9 +101,21 @@ void ABattleHUD::DrawLocalStatus(ATankPawn* MyTank)
 	DrawText(FString::Printf(TEXT("HP %.0f / %.0f"), Health->GetCurrentHealth(), Health->GetMaxHealth()),
 		FLinearColor::White, BarX, BarY - 20.0f, SmallFont, 1.0f);
 
-	// ---- 装填进度：GetReloadProgress 返回 0(刚开火)~1(可开火) ----
+	// ---- 装填进度与重生保护 ----
+	float ReloadRatio = 1.0f;
+	bool bSpawnProtected = false;
+	if (ATankPawn* PawnTank = Cast<ATankPawn>(MyTank))
+	{
+		ReloadRatio = PawnTank->GetReloadProgress();
+		bSpawnProtected = PawnTank->IsSpawnProtected();
+	}
+	else if (ATankVehicle* VehicleTank = Cast<ATankVehicle>(MyTank))
+	{
+		ReloadRatio = VehicleTank->GetReloadProgress();
+		bSpawnProtected = VehicleTank->IsSpawnProtected();
+	}
+
 	const float ReloadY = BarY + OwnBarSize.Y + 10.0f;
-	const float ReloadRatio = MyTank->GetReloadProgress();
 	const bool bReady = ReloadRatio >= 1.0f;
 	const FLinearColor ReloadColor = bReady
 		? FLinearColor(0.25f, 0.65f, 0.95f, 0.9f)
@@ -107,14 +126,171 @@ void ABattleHUD::DrawLocalStatus(ATankPawn* MyTank)
 		BarX, ReloadY + ReloadBarSize.Y + 4.0f, SmallFont, 1.0f);
 
 	// ---- 重生保护提示 ----
-	if (MyTank->IsSpawnProtected())
+	if (bSpawnProtected)
 	{
 		DrawCenteredText(TEXT("重生保护中（免疫伤害）"), Canvas->SizeY * 0.32f,
 			FLinearColor(0.35f, 0.85f, 1.0f, 0.95f), GEngine ? GEngine->GetMediumFont() : nullptr, 1.0f);
 	}
 }
 
-void ABattleHUD::DrawOverheadBars(ATankPawn* MyTank)
+void ABattleHUD::DrawCircle2D(float CenterX, float CenterY, float Radius, int32 Segments, FLinearColor Color, float Thickness)
+{
+	if (Segments < 3 || Radius <= 0.0f)
+	{
+		return;
+	}
+
+	const float AngleStep = 2.0f * PI / static_cast<float>(Segments);
+	float PrevX = CenterX + Radius;
+	float PrevY = CenterY;
+
+	for (int32 i = 1; i <= Segments; ++i)
+	{
+		const float Angle = static_cast<float>(i) * AngleStep;
+		const float NextX = CenterX + Radius * FMath::Cos(Angle);
+		const float NextY = CenterY + Radius * FMath::Sin(Angle);
+		DrawLine(PrevX, PrevY, NextX, NextY, Color, Thickness);
+		PrevX = NextX;
+		PrevY = NextY;
+	}
+}
+
+void ABattleHUD::DrawAimReticle(APawn* MyTank)
+{
+	if (!MyTank || !Canvas || !GetWorld())
+	{
+		return;
+	}
+
+	// 1. 获取主炮落点与瞄准状态
+	FVector AimPoint = FVector::ZeroVector;
+	float AimDistanceCm = 0.0f;
+	bool bLockedOnEnemy = false;
+	bool bHit = false;
+
+	if (ATankVehicle* VehicleTank = Cast<ATankVehicle>(MyTank))
+	{
+		const FAimTraceResult& Aim = VehicleTank->GetAimResult();
+		AimPoint = Aim.AimPoint;
+		AimDistanceCm = Aim.AimDistance;
+		bLockedOnEnemy = Aim.bLockedOnEnemy;
+		bHit = Aim.bHit;
+	}
+	else if (ATankPawn* PawnTank = Cast<ATankPawn>(MyTank))
+	{
+		if (UStaticMeshComponent* Gun = PawnTank->GetGunMesh())
+		{
+			const FVector MuzzleLoc = Gun->GetComponentTransform().TransformPosition(FVector(200.0f, 0.0f, 0.0f));
+			const FVector GunForward = Gun->GetForwardVector();
+			const FVector TraceEnd = MuzzleLoc + GunForward * 10000.0f;
+
+			FHitResult Hit;
+			FCollisionQueryParams Params(TEXT("PawnGunAimTrace"), false, PawnTank);
+			Params.AddIgnoredActor(PawnTank);
+
+			if (GetWorld()->LineTraceSingleByChannel(Hit, MuzzleLoc, TraceEnd, ECC_Visibility, Params))
+			{
+				AimPoint = Hit.ImpactPoint;
+				AimDistanceCm = Hit.Distance;
+				AActor* Target = Hit.GetActor();
+				bLockedOnEnemy = (Target != nullptr && Target != PawnTank && Target->IsA<APawn>());
+				bHit = true;
+			}
+			else
+			{
+				AimPoint = TraceEnd;
+				AimDistanceCm = 10000.0f;
+				bHit = false;
+			}
+		}
+	}
+
+	if (AimPoint.IsNearlyZero())
+	{
+		return;
+	}
+
+	// 2. 投影主炮落点到屏幕空间
+	const FVector Projected = Canvas->Project(AimPoint);
+	const bool bValidProjection = Projected.Z > 0.0f;
+	const FVector2D ScreenCenter(Canvas->SizeX * 0.5f, Canvas->SizeY * 0.5f);
+
+	// 3. 绘制屏幕中心视线基准白十字（玩家视线中心基准）
+	{
+		const float Gap = 4.0f;
+		const float Len = 8.0f;
+		const FLinearColor WhiteCross(1.0f, 1.0f, 1.0f, 0.75f);
+		DrawLine(ScreenCenter.X - Gap - Len, ScreenCenter.Y, ScreenCenter.X - Gap, ScreenCenter.Y, WhiteCross, 1.5f);
+		DrawLine(ScreenCenter.X + Gap, ScreenCenter.Y, ScreenCenter.X + Gap + Len, ScreenCenter.Y, WhiteCross, 1.5f);
+		DrawLine(ScreenCenter.X, ScreenCenter.Y - Gap - Len, ScreenCenter.X, ScreenCenter.Y - Gap, WhiteCross, 1.5f);
+		DrawLine(ScreenCenter.X, ScreenCenter.Y + Gap, ScreenCenter.X, ScreenCenter.Y + Gap + Len, WhiteCross, 1.5f);
+		DrawRect(WhiteCross, ScreenCenter.X - 1.0f, ScreenCenter.Y - 1.0f, 2.0f, 2.0f);
+	}
+
+	if (!bValidProjection)
+	{
+		return;
+	}
+
+	// 4. 计算伺服追赶与收敛状态（像素距离）
+	const FVector2D AimScreen(Projected.X, Projected.Y);
+	const float PixelDist = FVector2D::Distance(ScreenCenter, AimScreen);
+	const bool bConverged = PixelDist < AimConvergenceThreshold;
+
+	// 5. 状态分级颜色与动态散布圆环半径
+	FLinearColor ReticleColor;
+	float DynamicRadius = AimReticleBaseRadius;
+
+	if (bLockedOnEnemy)
+	{
+		// 敌方载具锁定：高亮警示纯红
+		ReticleColor = FLinearColor(1.0f, 0.15f, 0.15f, 0.95f);
+		DynamicRadius = AimReticleBaseRadius * 1.15f;
+	}
+	else if (bConverged)
+	{
+		// 伺服转到位：荧光绿
+		ReticleColor = FLinearColor(0.2f, 1.0f, 0.35f, 0.95f);
+		DynamicRadius = AimReticleBaseRadius;
+	}
+	else
+	{
+		// 炮塔伺服追赶中：青蓝，伴随动态扩圈（模拟主炮晃动/未稳定）
+		ReticleColor = FLinearColor(0.25f, 0.85f, 1.0f, 0.85f);
+		DynamicRadius = FMath::Clamp(AimReticleBaseRadius + PixelDist * 0.05f, AimReticleBaseRadius, 24.0f);
+
+		// 牵引引导线：从视线中心指向主炮物理落点
+		DrawLine(ScreenCenter.X, ScreenCenter.Y, AimScreen.X, AimScreen.Y, FLinearColor(0.25f, 0.85f, 1.0f, 0.35f), 1.0f);
+	}
+
+	// 6. 绘制动态主炮落点圆环与 4 向角标
+	DrawCircle2D(AimScreen.X, AimScreen.Y, DynamicRadius, 24, ReticleColor, 1.6f);
+	DrawLine(AimScreen.X - DynamicRadius - 5.0f, AimScreen.Y, AimScreen.X - DynamicRadius - 1.0f, AimScreen.Y, ReticleColor, 1.6f);
+	DrawLine(AimScreen.X + DynamicRadius + 1.0f, AimScreen.Y, AimScreen.X + DynamicRadius + 5.0f, AimScreen.Y, ReticleColor, 1.6f);
+	DrawLine(AimScreen.X, AimScreen.Y - DynamicRadius - 5.0f, AimScreen.X, AimScreen.Y - DynamicRadius - 1.0f, ReticleColor, 1.6f);
+	DrawLine(AimScreen.X, AimScreen.Y + DynamicRadius + 1.0f, AimScreen.X, AimScreen.Y + DynamicRadius + 5.0f, ReticleColor, 1.6f);
+	DrawRect(ReticleColor, AimScreen.X - 1.0f, AimScreen.Y - 1.0f, 2.0f, 2.0f);
+
+	// 7. 测距与锁定状态文本（带阴影）
+	UFont* SmallFont = GEngine ? GEngine->GetSmallFont() : nullptr;
+	const float DistM = AimDistanceCm * 0.01f;
+	FString DistText;
+	if (bLockedOnEnemy)
+	{
+		DistText = FString::Printf(TEXT("[锁定 %.0fm]"), DistM);
+	}
+	else
+	{
+		DistText = FString::Printf(TEXT("%.0fm"), DistM);
+	}
+
+	const float TextX = AimScreen.X + DynamicRadius + 8.0f;
+	const float TextY = AimScreen.Y - 6.0f;
+	DrawText(DistText, FLinearColor(0.0f, 0.0f, 0.0f, 0.85f), TextX + 1.0f, TextY + 1.0f, SmallFont, 1.0f);
+	DrawText(DistText, ReticleColor, TextX, TextY, SmallFont, 1.0f);
+}
+
+void ABattleHUD::DrawOverheadBars(APawn* MyTank)
 {
 	APlayerController* LocalPC = GetOwningPlayerController();
 	if (!LocalPC)
@@ -128,11 +304,15 @@ void ABattleHUD::DrawOverheadBars(ATankPawn* MyTank)
 	LocalPC->GetPlayerViewPoint(ViewLoc, ViewRot);
 
 	// 其他玩家坦克 → 头顶红色血条（>80m 距离剔除），并做遮挡剔除
-	for (TActorIterator<ATankPawn> It(GetWorld()); It; ++It)
+	for (TActorIterator<APawn> It(GetWorld()); It; ++It)
 	{
-		ATankPawn* Tank = *It;
+		APawn* Tank = *It;
 		// 用 Controller 归属跳过自己的坦克（PC->GetPawn 在重生瞬间为空，指针比对会漏判）
 		if (!Tank || Tank->IsPendingKillPending() || !Tank->GetController() || Tank->GetController() == LocalPC)
+		{
+			continue;
+		}
+		if (!Tank->IsA<ATankPawn>() && !Tank->IsA<ATankVehicle>())
 		{
 			continue;
 		}
@@ -148,16 +328,19 @@ void ABattleHUD::DrawOverheadBars(ATankPawn* MyTank)
 			continue;
 		}
 
-		// UCanvas::Project 返回的 Z 是裁剪空间 NDC 深度（= clipZ/W），并且只在该点位于
-		// 相机身后（V.W <= 0）时才被 bClampToZeroPlane 夹成 0（引擎原文注释：
-		// "if behind the screen, clamp depth to the screen"）。
-		// 所以判据是 Z > 0（在相机前方），原来写的 Z == 0 恰好反了——
-		// 那只会在坦克跑到身后时才通过，正前方的坦克反而永远画不出头顶血条。
-		//
-		// 锚点高度按车体实际高度推算（曾硬编码 240，那是 1:1 车高 236 时代的常数）：
-		// 坦克整车的 VehicleScale 一改，血条与名牌会自动跟着降下来
-		const float BarAnchorZ = Tank->GetSimpleCollisionHalfHeight() * 2.0f + 8.0f;
+		float HalfHeight = 60.0f;
+		if (ATankPawn* PawnTank = Cast<ATankPawn>(Tank))
+		{
+			HalfHeight = PawnTank->GetSimpleCollisionHalfHeight();
+		}
+		else if (ATankVehicle* VehicleTank = Cast<ATankVehicle>(Tank))
+		{
+			HalfHeight = VehicleTank->GetBodyHalfHeight();
+		}
+
+		const float BarAnchorZ = HalfHeight * 2.0f + 8.0f;
 		const FVector BarWorldLoc = TankLoc + FVector(0.0f, 0.0f, BarAnchorZ);
+
 		const FVector Projected = Canvas->Project(BarWorldLoc);
 		const bool bOnScreen = Projected.Z > 0.0f
 			&& Projected.X > -OverheadBarSize.X && Projected.X < Canvas->SizeX + OverheadBarSize.X
@@ -186,7 +369,7 @@ void ABattleHUD::DrawOverheadBars(ATankPawn* MyTank)
 		DrawBar(Ratio, Projected.X - OverheadBarSize.X * 0.5f, Projected.Y, OverheadBarSize.X, OverheadBarSize.Y,
 			FLinearColor(0.85f, 0.12f, 0.12f, 0.9f));
 
-		// 名牌画在血条上方；名字与血条同生共死，所以沿用同一套投影与遮挡判据，不单独再测一次射
+		// 名牌画在血条上方；名字与血条同生共死，所以沿用同一套投影与遮挡判据，不单独再测一次射线
 		const FString PlayerName = ResolvePlayerName(Tank);
 		if (!PlayerName.IsEmpty())
 		{
@@ -195,7 +378,7 @@ void ABattleHUD::DrawOverheadBars(ATankPawn* MyTank)
 	}
 }
 
-FString ABattleHUD::ResolvePlayerName(const ATankPawn* Tank)
+FString ABattleHUD::ResolvePlayerName(const APawn* Tank)
 {
 	const AController* Ctrl = Tank ? Tank->GetController() : nullptr;
 	const APlayerState* PS = Ctrl ? Ctrl->PlayerState : nullptr;

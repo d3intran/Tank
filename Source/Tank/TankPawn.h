@@ -335,6 +335,7 @@ public:
 	FORCEINLINE float GetCurrentTurretYaw() const { return CurrentTurretYaw; }
 	FORCEINLINE float GetCurrentPitch() const { return CurrentPitch; }
 	FORCEINLINE float GetCurrentMoveSpeed() const { return MoveSpeed; }
+	FORCEINLINE UStaticMeshComponent* GetGunMesh() const { return GunMesh; }
 
 	/** 车体中心到顶面的高度（**世界单位**，已含 VehicleScale）。
 	 *  HUD 的头顶血条/名牌锚点用它，整车缩放后名牌会自动跟着降下来，不必再硬编码。
